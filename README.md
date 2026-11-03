@@ -53,6 +53,17 @@ nix-shell -p 'python3.withPackages (ps: [ ps.pyusb ])' --run \
   'PYTHONPATH=src python3 -m ada305 status'
 ```
 
+Or use the flake (Python, pyusb, pytest, ruff, and libusb are pinned):
+
+```sh
+nix run .# -- list-devices
+nix run .# -- status          # needs device permission; see below
+nix develop                   # dev shell with pytest, ruff, usbutils
+nix build                     # ./result/bin/ada305
+nix flake check               # builds the package and runs all 81 tests
+nix fmt                       # format flake.nix with nixfmt
+```
+
 Or install into a virtual environment:
 
 ```sh
