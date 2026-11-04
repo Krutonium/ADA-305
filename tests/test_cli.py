@@ -17,14 +17,10 @@ def run(monkeypatch, transport, argv):
     return cli.main(argv)
 
 
-def bracketed(register, data):
-    """The three writes ALSERV uses for a host volume change."""
+def direct(register, data):
+    """One direct register write; the reference ADA305 needs no 0x0500 bracket."""
 
-    return [
-        (p.REQ_REGISTER_WRITE, p.REG_CONTROL, b"\x02"),
-        (p.REQ_REGISTER_WRITE, register, data),
-        (p.REQ_REGISTER_WRITE, p.REG_CONTROL, b"\x03"),
-    ]
+    return [(p.REQ_REGISTER_WRITE, register, data)]
 
 
 def test_default_command_is_read_only_status(monkeypatch, transport, capsys):
@@ -57,7 +53,7 @@ def test_raw_read_is_read_only(monkeypatch, transport, capsys):
 def test_volume_increase_writes_without_extra_flag(monkeypatch, transport):
     # 56 -> 60 is louder (60 dB -> 53 dB attenuation); no --yes is needed.
     assert run(monkeypatch, transport, ["volume", "master", "60"]) == 0
-    assert transport.writes == bracketed(p.REG_VOLUME_BASE, b"\x00\x35")
+    assert transport.writes == direct(p.REG_VOLUME_BASE, b"\x00\x35")
 
 
 def test_volume_increase_prints_warning(monkeypatch, transport, capsys):
@@ -67,7 +63,7 @@ def test_volume_increase_prints_warning(monkeypatch, transport, capsys):
 
 def test_level_90_is_allowed_without_opt_in(monkeypatch, transport):
     assert run(monkeypatch, transport, ["volume", "master", "90"]) == 0
-    assert transport.writes == bracketed(p.REG_VOLUME_BASE, b"\x00\x20")
+    assert transport.writes == direct(p.REG_VOLUME_BASE, b"\x00\x20")
 
 
 def test_level_91_is_refused_without_opt_in(monkeypatch, transport, capsys):
@@ -83,7 +79,7 @@ def test_level_91_with_opt_in_writes(monkeypatch, transport):
         run(monkeypatch, transport, ["volume", "master", "91", "--yes-very-loud"])
         == 0
     )
-    assert transport.writes == bracketed(p.REG_VOLUME_BASE, b"\x00\x1f")
+    assert transport.writes == direct(p.REG_VOLUME_BASE, b"\x00\x1f")
 
 
 def test_level_100_with_opt_in_writes_maximum(monkeypatch, transport):
@@ -91,7 +87,7 @@ def test_level_100_with_opt_in_writes_maximum(monkeypatch, transport):
         run(monkeypatch, transport, ["volume", "master", "100", "--yes-very-loud"])
         == 0
     )
-    assert transport.writes == bracketed(p.REG_VOLUME_BASE, b"\x00\x19")
+    assert transport.writes == direct(p.REG_VOLUME_BASE, b"\x00\x19")
 
 
 def test_level_100_without_opt_in_is_refused(monkeypatch, transport):
@@ -108,7 +104,7 @@ def test_option_before_subcommand_is_honoured(monkeypatch, transport):
         )
         == 0
     )
-    assert transport.writes == bracketed(p.REG_VOLUME_BASE, b"\x00\x1f")
+    assert transport.writes == direct(p.REG_VOLUME_BASE, b"\x00\x1f")
 
 
 def test_option_after_subcommand_is_honoured(monkeypatch, transport):
@@ -120,12 +116,12 @@ def test_option_after_subcommand_is_honoured(monkeypatch, transport):
         )
         == 0
     )
-    assert transport.writes == bracketed(p.REG_VOLUME_BASE, b"\x00\x1f")
+    assert transport.writes == direct(p.REG_VOLUME_BASE, b"\x00\x1f")
 
 
 def test_quieter_volume_writes(monkeypatch, transport):
     assert run(monkeypatch, transport, ["volume", "master", "50"]) == 0
-    assert transport.writes == bracketed(p.REG_VOLUME_BASE, b"\x00\x3c")
+    assert transport.writes == direct(p.REG_VOLUME_BASE, b"\x00\x3c")
 
 
 def test_volume_dry_run_never_writes(monkeypatch, transport, capsys):
@@ -248,25 +244,27 @@ def test_describe_report_never_applies_anything():
     assert report.volume_delta == -1
 
 
-def test_release_writes_local_control(monkeypatch, transport, capsys):
+def test_release_never_writes_and_explains_follow(
+    monkeypatch, transport, capsys
+):
     assert run(monkeypatch, transport, ["release"]) == 0
-    assert transport.writes == [
-        (p.REQ_REGISTER_WRITE, p.REG_CONTROL, b"\x03")
-    ]
-    assert "0x0500" in capsys.readouterr().out
+    assert transport.writes == []
+    out = capsys.readouterr().out
+    assert "0x0500" in out
+    assert "ada305 follow" in out
+    assert "No write" in out
 
 
-def test_return_control_alias(monkeypatch, transport):
+def test_return_control_alias_is_harmless(monkeypatch, transport, capsys):
     assert run(monkeypatch, transport, ["return-control"]) == 0
-    assert transport.writes == [
-        (p.REQ_REGISTER_WRITE, p.REG_CONTROL, b"\x03")
-    ]
+    assert transport.writes == []
+    assert "ada305 follow" in capsys.readouterr().out
 
 
 def test_release_dry_run_never_writes(monkeypatch, transport, capsys):
     assert run(monkeypatch, transport, ["release", "--dry-run"]) == 0
     assert transport.writes == []
-    assert "Dry run" in capsys.readouterr().out
+    assert "No write" in capsys.readouterr().out
 
 
 def test_monitor_defaults_to_endpoint_packet_size(monkeypatch, transport, capsys):
@@ -302,4 +300,83 @@ def test_help_lists_volume_and_mute_examples(capsys):
     out = capsys.readouterr().out
     assert "ada305 volume master 50" in out
     assert "ada305 mute on" in out
+    assert "ada305 follow" in out
     assert "ada305 release" in out
+
+
+def test_follow_applies_selector_and_wheel(monkeypatch, transport, capsys):
+    transport.interrupt_reports = [b"\x10\x00", b"\x00\xff"]
+    assert (
+        run(
+            monkeypatch,
+            transport,
+            ["follow", "--count", "2", "--yes-very-loud"],
+        )
+        == 0
+    )
+    assert transport.writes == [
+        (p.REQ_REGISTER_WRITE, p.REG_VOLUME_BASE + 4, b"\x00\x01")
+    ]
+    out = capsys.readouterr().out
+    assert "Subwoofer selected" in out
+
+
+def test_follow_ignores_louder_click_by_default(
+    monkeypatch, transport, capsys
+):
+    transport.interrupt_reports = [b"\x00\x01"]
+    assert run(monkeypatch, transport, ["follow", "--count", "1"]) == 0
+    assert transport.writes == []
+    assert "--allow-increase" in capsys.readouterr().err
+
+
+def test_follow_allows_louder_click_with_flag(monkeypatch, transport):
+    transport.interrupt_reports = [b"\x00\x01"]
+    assert (
+        run(
+            monkeypatch,
+            transport,
+            ["follow", "--count", "1", "--allow-increase"],
+        )
+        == 0
+    )
+    assert transport.writes == [
+        (p.REQ_REGISTER_WRITE, p.REG_VOLUME_BASE, b"\x00\x37")
+    ]
+
+
+def test_follow_dry_run_never_writes(monkeypatch, transport, capsys):
+    transport.interrupt_reports = [b"\x10\x00", b"\x00\xff", b"\x01\x00"]
+    assert (
+        run(
+            monkeypatch,
+            transport,
+            [
+                "follow",
+                "--count",
+                "3",
+                "--allow-increase",
+                "--yes-very-loud",
+                "--dry-run",
+            ],
+        )
+        == 0
+    )
+    assert transport.writes == []
+    out = capsys.readouterr().out
+    assert "Dry run" in out
+    assert "[dry-run]" in out
+
+
+def test_follow_mute_packet_toggles(monkeypatch, transport):
+    transport.interrupt_reports = [b"\x01\x00"]
+    assert run(monkeypatch, transport, ["follow", "--count", "1"]) == 0
+    assert transport.writes == [
+        (p.REQ_REGISTER_WRITE, p.REG_MUTE, b"\x01")
+    ]
+
+
+def test_follow_rejects_bad_options(monkeypatch, transport, capsys):
+    assert run(monkeypatch, transport, ["follow", "--count", "-1"]) == 2
+    assert transport.writes == []
+    assert "--count" in capsys.readouterr().err

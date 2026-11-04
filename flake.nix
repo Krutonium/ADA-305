@@ -18,7 +18,7 @@
         let
           ada305 = pkgs.python3Packages.buildPythonPackage {
             pname = "ada305";
-            version = "0.2.1";
+            version = "0.3.0";
             pyproject = true;
             src = ./.;
 

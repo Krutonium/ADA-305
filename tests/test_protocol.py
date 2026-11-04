@@ -124,10 +124,36 @@ def test_interrupt_report_decode():
 
 
 def test_interrupt_report_signed_delta():
-    # 0xFF = -1: attenuation drops by one, i.e. one step louder.
+    # 0xFF = -1: attenuation rises by one, i.e. one step quieter.
     report = p.decode_interrupt_report(b"\x00\xff")
     assert report.volume_delta == -1
     assert report.flags == 0
+
+
+@pytest.mark.parametrize(
+    "flag,key",
+    [
+        (p.FLAG_SELECT_SUBWOOFER, "sub"),
+        (p.FLAG_SELECT_CENTER, "center"),
+        (p.FLAG_SELECT_SURROUND, "surround-left"),
+    ],
+)
+def test_selector_flags_map_to_channels(flag, key):
+    report = p.decode_interrupt_report(bytes((flag, 0)))
+    assert report.selector_flags == flag
+    assert report.selector_flag == flag
+    assert report.selector_channel is not None
+    assert report.selector_channel.key == key
+    assert report.volume_delta == 0
+
+
+def test_multiple_selector_bits_are_not_a_single_channel():
+    report = p.decode_interrupt_report(
+        bytes((p.FLAG_SELECT_SUBWOOFER | p.FLAG_SELECT_CENTER, 0))
+    )
+    assert report.selector_flags == 0x30
+    assert report.selector_flag is None
+    assert report.selector_channel is None
 
 
 def test_interrupt_report_too_short():

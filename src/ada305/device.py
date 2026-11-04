@@ -189,28 +189,61 @@ class Ada305:
 
     # -- writes ----------------------------------------------------------
 
-    def _begin_host_control(self) -> None:
-        """Bracket a host volume write (ALSERV writes 0x0500 <- 2)."""
+    def write_channel_db(self, channel_name: str, target_db: int) -> VolumeResult:
+        """Write an exact attenuation value and verify the read-back.
 
-        self.transport.write_control(
-            p.REQ_REGISTER_WRITE,
-            p.REG_CONTROL,
-            p.encode_control(p.CONTROL_HOST),
-        )
+        This is the primitive used by the physical-control follower.  The
+        caller is responsible for deciding whether a change is allowed; this
+        method only enforces the documented hardware range and never clamps.
 
-    def return_control(self) -> None:
-        """Give the speaker's local buttons and knob control again.
-
-        ALSERV writes register ``0x0500 = 3`` immediately after every
-        host-initiated volume change.  Without that release the speaker can
-        stay in host-control mode and ignore its own controls until it is
-        power cycled.
+        The reference ADA305 accepts direct volume-register writes without the
+        ``0x0500`` host/local handoff that ALSERV uses; writing ``0x0500`` on
+        this unit stalls with ``EPIPE`` and is not performed.
         """
 
+        try:
+            channel = p.resolve_channel(channel_name)
+        except KeyError as exc:
+            raise SafetyError(str(exc)) from None
+        if not channel.writable:
+            raise SafetyError(
+                f"{channel.label} is not independently writable on the ADA305"
+            )
+        if isinstance(target_db, bool) or not isinstance(target_db, int):
+            raise SafetyError(
+                "target attenuation must be an integer, not "
+                f"{type(target_db).__name__}"
+            )
+        if not channel.min_db <= target_db <= channel.max_db:
+            raise SafetyError(
+                f"{channel.label} attenuation {target_db} dB is outside the "
+                f"documented range {channel.min_db}..{channel.max_db}; "
+                "refusing to clamp"
+            )
+
+        current_db = self.read_channel(channel.key).db
+        if target_db == current_db:
+            return VolumeResult(
+                level=db_to_level(channel, target_db),
+                db=target_db,
+                changed=False,
+            )
+
         self.transport.write_control(
             p.REQ_REGISTER_WRITE,
-            p.REG_CONTROL,
-            p.encode_control(p.CONTROL_LOCAL),
+            channel.register,
+            p.encode_volume(target_db),
+        )
+        actual_db = self.read_channel(channel.key).db
+        if actual_db != target_db:
+            raise DeviceError(
+                f"{channel.label} read-back mismatch: requested "
+                f"{target_db} dB, got {actual_db} dB"
+            )
+        return VolumeResult(
+            level=db_to_level(channel, actual_db),
+            db=actual_db,
+            changed=True,
         )
 
     def write_mute(self, muted: bool) -> bool:
@@ -277,27 +310,7 @@ class Ada305:
                 f"{actual_current} dB while planning; refusing to write. "
                 "Read the status again."
             )
-
-        self._begin_host_control()
-        try:
-            self.transport.write_control(
-                p.REQ_REGISTER_WRITE, plan.channel.register, plan.encoded
-            )
-        finally:
-            # Always hand control back, even if the volume write failed, so a
-            # physical knob/button cannot be left locked out.
-            self.return_control()
-        actual_db = self.read_channel(plan.channel.key).db
-        if actual_db != plan.requested_db:
-            raise DeviceError(
-                f"{plan.channel.label} read-back mismatch: requested "
-                f"{plan.requested_db} dB, got {actual_db} dB"
-            )
-        return VolumeResult(
-            level=db_to_level(plan.channel, actual_db),
-            db=actual_db,
-            changed=True,
-        )
+        return self.write_channel_db(plan.channel.key, plan.requested_db)
 
     def set_volume(
         self,

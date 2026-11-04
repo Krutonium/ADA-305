@@ -2,8 +2,8 @@
 
 Everything in this document was recovered by static analysis of the original
 Windows AMS24 driver stack (`al60.sys`, `ALSERV.exe`) and checked with
-read-only requests against a physical ADA305 (`04d2:0305`). See
-[Provenance](#provenance) for file hashes.
+read-only requests and live physical-control captures against a physical
+ADA305 (`04d2:0305`). See [Provenance](#provenance) for file hashes.
 
 The device exposes a vendor-specific USB interface:
 
@@ -69,8 +69,8 @@ fully characterised.
 | `0x0204` | 2 | Subwoofer attenuation | R/W |
 | `0x0205` | 2 | Surround-left attenuation | R/W |
 | `0x0206` | 2 | Surround-right on some models; **not independent on ADA305** | n/a |
-| `0x0300` | 1 | Input / source routing | W (not used) |
-| `0x0500` | 1 | Host/local control handoff: `2` = host applying, `3` = local | W |
+| `0x0300` | 1 | Channel-selector write (sub/center/surround); LEDs did not respond on the reference unit | W (not used) |
+| `0x0500` | 1 | ALSERV host/local handoff: `2` = host applying, `3` = local; **stalls on the reference unit** | not used |
 | `0xA500` | 1 | Mode state byte | R/W (read only here) |
 
 ### ADA305 channels
@@ -181,7 +181,7 @@ current value was used once to validate the OUT path and read back unchanged.
 
 ---
 
-## 5. Host/local control handoff (`0x0500`)
+## 5. Host/local control handoff (`0x0500`) — not used
 
 ALSERV brackets every host-initiated volume write with a one-byte write to
 register `0x0500`:
@@ -189,7 +189,7 @@ register `0x0500`:
 ```c
 write_register(0x0500, 2);   // host is applying the change
 write_register(0x0200 + channel, encoded_volume);
-write_register(0x0500, 3);   // hand control back to the local controls
+write_register(0x0500, 3);   // nominal "local control"
 ```
 
 This is `FUN_00403ee0(2)` / `FUN_00403ee0(3)` in `ALSERV.exe`, called directly
@@ -197,12 +197,16 @@ around `FUN_00404250` (the volume write). The same function is only called with
 `1` at startup on model `0x60`, where its meaning is not established. No other
 register I/O is bracketed this way, including the mute write (`0x0100`).
 
-The physical evidence is behavioural as well as static: leaving the device at
-`0x0500 = 2` (or omitting the release after a host write) is consistent with the
-speaker ignoring its own knob/buttons until it is power cycled. This library
-therefore sends `2`, performs the volume write, and always attempts `3`, even if
-the write fails. The explicit `ada305 release` command sends `3` on its own.
-`0x0500` is write-only here; there is no documented read-back to verify.
+On the reference ADA305, every `0x0500` write tried during this work stalled
+with `EPIPE` (`[Errno 32] Pipe error`). Direct writes to `0x0200` succeeded and
+read back exactly, with and without the bracket. The bracket is therefore an
+ALSERV implementation detail that this unit does not need, not a usable
+"return control" command.
+
+In USB mode the physical controls are not applied on the device at all: the
+speaker reports wheel and button events and expects the host to apply them.
+The library writes volume registers directly, and `ada305 follow` applies the
+reports. `ada305 release` performs no write.
 
 This is distinct from `0xA500`, which is the *mode state byte* read by
 `FUN_00403cc0` and written by `FUN_00404000` as part of mode selection.
@@ -255,15 +259,19 @@ bytes 2..6  model-specific (zero/unused on ADA305)
 
 Flag bits recovered from ALSERV's parser:
 
-| Bit | Meaning | ADA305 |
-| --- | --- | --- |
-| `0x01` | Toggle mute | yes |
-| `0x02` | Cycle mode | ignored |
-| `0x08` | Unmute request | non-ADA305 |
-| `0x10` | Input select | non-ADA305 |
-| `0x20` | Input select | non-ADA305 |
-| `0x40` | Input select | non-ADA305 |
-| `0x80` | Reconnect / re-initialise | yes |
+| Bit | Meaning | ADA305 | Live value |
+| --- | --- | --- | --- |
+| `0x01` | Toggle mute | yes | `01 00` (repeats while held) |
+| `0x02` | Cycle mode | ignored | not observed |
+| `0x08` | Unmute request | non-ADA305 | not observed |
+| `0x10` | Select subwoofer | yes | `10 00` (repeats) |
+| `0x20` | Select center | yes | `20 00` (repeats) |
+| `0x40` | Select surround | yes | `40 00` (repeats) |
+| `0x80` | Reconnect / re-initialise | yes | not observed in the capture |
+
+`00 00` is idle / button-release and does not deselect a channel. A selector
+press emits several identical packets, so a host-side follower must debounce
+them or it will toggle the selection repeatedly.
 
 The delta is signed. ALSERV computes:
 
@@ -271,23 +279,26 @@ The delta is signed. ALSERV computes:
 new_attenuation = current_attenuation - delta
 ```
 
-so a **positive delta means louder** (attenuation decreases). The report is a
-*request*: the host is expected to apply it with a control write. The device
-does not change its own volume register from a button press.
+so a **positive delta means louder** (attenuation decreases). Live wheel
+captures: `00 01` is one click louder and `00 ff` is one click quieter. The
+report is a *request*: the host is expected to apply it with a control write.
+The device does not change its own volume register from a button press. This is
+why the wheel can click with no audible change while only a read-only monitor
+is running.
 
 ALSERV clamps the computed value to the channel's stored minimum/maximum before
-writing it. That matters: a single large positive delta can jump directly to
-maximum volume. One report has been observed on the reference unit while idle:
+writing it. This library deliberately does not: it ignores a click that would
+leave the documented range. That matters because a report can carry a large
+delta. One report has been observed on the reference unit while idle:
 
 ```text
 raw=00 3c   flags=0x00   delta=+60
 ```
 
-If that were applied naively to master `56`, the result would be `56 - 60 = -4`
-and ALSERV's clamp would take it to `25` dB — the hardware maximum. `ada305
-monitor` therefore only decodes reports and never applies them. The trigger for
-this report is not yet understood; idle reads otherwise time out. The parser is
-covered by unit tests.
+If that were applied naively to master `56`, the result would be `56 - 60 = -4`;
+ALSERV's clamp would take it to `25` dB — the hardware maximum. `ada305
+monitor` therefore only decodes reports and never applies them, and `ada305
+follow` refuses changes outside the documented range and gates loud targets.
 
 ---
 
@@ -300,20 +311,40 @@ covered by unit tests.
    clamped.
 4. Target levels above `90` require `allow_very_loud=True` / `--yes-very-loud`,
    unless the request is a no-op that sends nothing.
-5. Volume increases print a warning; they need no additional flag.
+5. Explicit volume commands print a warning for increases. The follower ignores
+   increases unless `allow_increase=True` / `--allow-increase` is given.
 6. `execute_volume` re-reads the current value immediately before the write and
    aborts if it changed after planning.
-7. Volume writes are bracketed with `0x0500 = 2` / `3`, and the release is
-   attempted in a `finally` block even if the volume write fails.
-8. Every write is read back and must match exactly, except the write-only
-   `0x0500` handoff.
+7. Volume writes are direct writes to `0x0200+n`. Register `0x0500` is never
+   written: it stalls on the reference unit and is not needed.
+8. Every write is read back and must match exactly.
 9. No startup/reset/initialise write is performed.
-10. The interrupt monitor never writes; `release` is a separate explicit
-    command.
+10. The interrupt monitor never writes. `follow` is the explicit command that
+    applies reports, with the gates above.
 
 ---
 
-## 9. Provenance
+## 9. Follower semantics
+
+`ada305 follow` tracks the selected channel host-side:
+
+* A `10` / `20` / `40` report selects subwoofer / center / surround-left. The
+  same selector again returns to master. Selector packets are debounced (0.35 s
+  by default).
+* Three seconds after the last volume change on a selected channel, the
+  follower returns to master, matching the AMS help text and ALSERV's timer.
+* Each wheel report is one attenuation step: `new = current - delta`. The
+  follower reads the current value, ignores a step outside the channel range,
+  writes the new value directly, and verifies it.
+* A debounced `01` toggles mute.
+* `80` drops the selection, re-reads mute/mode, and returns to master.
+
+Writing `0x0300` with ALSERV's selector values was accepted but did not light
+the channel LEDs on the reference unit, so the follower does not write it.
+
+---
+
+## 10. Provenance
 
 Static-analysis inputs, SHA-256:
 

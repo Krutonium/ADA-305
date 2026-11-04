@@ -29,9 +29,10 @@ This tool is not:
 | Increases print a warning | A change that lowers attenuation warns on stderr, then proceeds. |
 | No-op writes are skipped | A request that maps to the current attenuation sends nothing. |
 | No hidden initialisation | The tool never resets, re-initialises, or writes at startup. |
-| Host control is released | Volume writes are bracketed with `0x0500 = 2` / `3`, matching ALSERV; the release is sent even if the write fails. |
+| Direct volume writes | Volume writes go straight to `0x0200+n`; the `0x0500 = 2/3` bracket ALSERV uses stalls with `EPIPE` on this unit and is not sent. |
 | Read-back verification | Every write is read back; a mismatch is an error. |
 | Interrupt monitor is read-only | Physical-control reports are decoded, never applied. |
+| Follower is explicit and gated | `ada305 follow` applies wheel clicks; louder clicks need `--allow-increase`, and targets above level 90 also need `--yes-very-loud`. |
 | Tests never touch hardware | All tests use `FakeTransport`; there is no opt-in live test. |
 
 A no-op at level `91..100` is allowed without the flag because it sends
@@ -86,7 +87,8 @@ SUBSYSTEM=="usb", ATTR{idVendor}=="04d2", ATTR{idProduct}=="0305", MODE="0660", 
 
 Reload with `sudo udevadm control --reload-rules && sudo udevadm trigger`.
 No kernel driver is bound to the vendor interface; the tool does not detach or
-rebind anything (except claiming interface 0 for the interrupt monitor).
+rebind anything (except claiming interface 0 for the interrupt monitor and
+follower).
 
 ---
 
@@ -99,7 +101,8 @@ commands:
   status        read mute, volume, and mode (default)
   mute on|off|toggle
   volume CHANNEL LEVEL
-  release       return control to the speaker's own buttons/knob
+  follow        apply the speaker's physical wheel and buttons
+  release       explain control in USB mode (does not write)
   raw-read REGISTER [--length N]
   monitor       decode interrupt-IN reports (read-only)
   list-devices  list matching USB devices
@@ -169,20 +172,44 @@ python3 -m ada305 mute off    # warns before unmuting
 python3 -m ada305 mute toggle --dry-run
 ```
 
-### Return control to the speakers
+### Use the speaker's own wheel and buttons
 
-The original service brackets every host volume change with register `0x0500`:
-`2` while the host is applying the change, then `3` to hand control back to the
-speaker's own buttons and knob. This tool does the same automatically for
-volume writes. If the physical controls are still unresponsive (for example
-after an interrupted write or after `monitor` handled a button report), send the
-release explicitly:
+In USB mode the speaker does **not** apply its own wheel or button changes. It
+only reports them on interrupt-IN endpoint `0x81`; the host must apply them.
+That is why turning the wheel can click while nothing changes when only a
+read-only monitor is running.
+
+`follow` applies those reports:
+
+```sh
+# Quieter wheel clicks only; louder clicks are ignored.
+python3 -m ada305 follow
+
+# Apply wheel clicks in both directions.
+python3 -m ada305 follow --allow-increase
+
+# Also permit targets above level 90.
+python3 -m ada305 follow --allow-increase --yes-very-loud
+```
+
+Press a channel selector to route the wheel to subwoofer, center, or surround;
+press the same selector again (or wait three seconds after the last volume
+change) to return the wheel to master. The mute combination toggles mute.
+
+The follower is a foreground process; stop it with Ctrl-C. It applies each
+wheel click directly and verifies the read-back. A click that would leave the
+documented attenuation range is ignored, never clamped.
+
+### `release` and register `0x0500`
+
+ALSERV brackets host volume changes with `0x0500 = 2` / `3`. On the reference
+ADA305 that write stalls with `EPIPE`; direct volume writes work and verify
+without it. `ada305 release` therefore performs **no write**. It explains the
+situation and points at `follow`:
 
 ```sh
 python3 -m ada305 release
 ```
-
-This writes only `0x0500 = 3`; it does not change volume or mute.
 
 ### Raw reads and monitoring
 
@@ -200,8 +227,8 @@ that prevents the `EOVERFLOW` crash that used to happen on a physical button
 press. Reports are only generated when a physical control is used; idle reads
 time out, which the monitor reports and then continues.
 
-If the speaker's own controls are unresponsive after monitoring, run
-`ada305 release`.
+If the wheel or buttons appear dead, that is expected while no follower is
+running. Use `ada305 follow` to apply them; `monitor` itself never writes.
 
 ### List devices
 
@@ -214,7 +241,7 @@ python3 -m ada305 list-devices
 ## Library
 
 ```python
-from ada305 import Ada305, PyUsbTransport, SafetyError
+from ada305 import Ada305, Follower, FollowerSettings, PyUsbTransport
 
 with PyUsbTransport.open() as transport:
     device = Ada305(transport)
@@ -226,13 +253,21 @@ with PyUsbTransport.open() as transport:
     plan = device.prepare_volume("master", 60)
     print(plan.describe(), plan.encoded.hex(" "))
 
-    # Execute after you have decided to apply the plan.  This brackets the
-    # write with 0x0500 = 2 / 3 so the speaker's own controls stay usable.
+    # Execute after you have decided to apply the plan.  This is a direct
+    # register write; the unusable 0x0500 bracket is not sent.
     result = device.execute_volume(plan)
     print(result.level, result.db, result.changed)
 
-    # Explicitly hand control back if a previous write was interrupted.
-    device.return_control()
+    # Apply one exact attenuation step (the physical-control primitive).
+    print(device.write_channel_db("master", 61))
+
+    # Apply reported wheel/button events with explicit safety policy.
+    follower = Follower(
+        device,
+        FollowerSettings(allow_increase=True, allow_very_loud=False),
+    )
+    report = device.read_interrupt(timeout_ms=2000)
+    follower.handle_report(report)
 ```
 
 `prepare_volume` accepts the 0..100 level. Any target above `90` requires
@@ -240,6 +275,8 @@ with PyUsbTransport.open() as transport:
 unknown channels, and mirrored channels raise `SafetyError` subclasses.
 `execute_volume` re-reads the register immediately before writing and aborts if
 it changed while planning. All writes verify the read-back.
+`write_channel_db` writes one exact attenuation step and refuses anything
+outside the channel's documented range; it does not clamp.
 
 The transport is a small protocol (`read_control`, `write_control`,
 `read_interrupt`), so the device layer is easy to test with a fake; see
@@ -255,10 +292,10 @@ nix-shell -p 'python3.withPackages (ps: [ ps.pytest ps.pyusb ])' --run \
 ```
 
 The suite covers codecs, channel aliases, the 0..100 mapping, every range and
-very-loud refusal, no-op handling, exact write encodings, the `0x0500` control
-bracket, interrupt buffer rounding and overflow handling, read-back mismatches,
-and CLI option placement. No test opens a real USB device, and there is no test
-that performs a real volume write.
+very-loud refusal, no-op handling, exact write encodings, direct writes,
+follower debounce and channel timeouts, interrupt buffer rounding and overflow
+handling, read-back mismatches, and CLI option placement. No test opens a real
+USB device, and there is no test that performs a real volume write.
 
 ---
 
@@ -274,13 +311,15 @@ that performs a real volume write.
 * Only the ADA305 (`04d2:0305`) is implemented and tested on hardware.
 * `ADA495` shares the ADA305 protocol and ranges and should work, but has not
   been tested here.
-* The interrupt report layout is recovered from ALSERV. One report has been
-  observed (`00 3c`: no flags, delta `+60`), but its trigger is not understood;
-  `monitor` remains read-only and experimental. Applying that report naively
-  would have clamped master to the maximum volume.
+* The interrupt report model is confirmed by live capture on the reference
+  unit: `10`/`20`/`40` select subwoofer/center/surround, `01` toggles mute,
+  `00 01`/`00 ff` are wheel clicks, and `80` is reconnect. `monitor` remains
+  read-only; only `follow` applies reports.
+* Writing `0x0300` with ALSERV's selector values was accepted by the device but
+  did not light the channel LEDs on the reference unit. `follow` does not write
+  it; channel selection is tracked host-side.
 * Mode switching is read but deliberately not writable: the exact side effects
   of writing `0xA500`/state are not needed for safe volume control.
-* Input routing (`0x300`) is documented but not written.
-* `0x0500 = 2/3` is the host/local control handoff observed in ALSERV. The
-  release value is only written automatically around volume changes and by the
-  explicit `release` command; other firmware meanings of `0x0500` are unknown.
+* `0x0500 = 2/3` is the host/local handoff observed in ALSERV, but the write
+  stalls with `EPIPE` on this unit and is not used. Direct volume writes work
+  and verify without it; `release` performs no write.

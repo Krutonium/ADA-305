@@ -9,9 +9,10 @@ Volumes are exposed as a 0..100 level: 0 is minimum volume, 100 is maximum.
 The wire protocol still uses dB attenuation.  See ``docs/PROTOCOL.md``.
 """
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 from .device import Ada305, DeviceError, Status, VolumeResult
+from .follow import Follower, FollowerSettings
 from .protocol import (
     CHANNELS,
     CONTROL_HOST,
@@ -55,6 +56,8 @@ __all__ = [
     "CONTROL_LOCAL",
     "Channel",
     "DeviceError",
+    "Follower",
+    "FollowerSettings",
     "LEVEL_MAX",
     "LEVEL_MIN",
     "PID_ADA305",

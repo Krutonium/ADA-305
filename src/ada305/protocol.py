@@ -79,14 +79,19 @@ WINDEX_WINDOWS_DRIVER: Final = 0x0F01
 
 REG_MUTE: Final = 0x0100
 REG_VOLUME_BASE: Final = 0x0200
-REG_INPUT_CONTROL: Final = 0x0300  # 1-byte write-only, source/input routing
-REG_CONTROL: Final = 0x0500        # 1-byte write-only, host/local control handoff
+REG_INPUT_CONTROL: Final = 0x0300  # 1-byte write-only channel selector/LEDs
+REG_CONTROL: Final = 0x0500        # 1-byte write-only, ALSERV only; see below
 REG_MODE_STATE: Final = 0xA500     # 1-byte read/write mode state
 
 # ALSERV writes these values to 0x0500 immediately before and after a
 # host-initiated volume change (FUN_00403ee0(2) / FUN_00403ee0(3)).
-CONTROL_HOST: Final = 2   # host is applying a change; keep local input quiet
-CONTROL_LOCAL: Final = 3  # hand control back to the speaker's buttons/knob
+#
+# On the reference ADA305 this write stalls with EPIPE and is not needed:
+# direct volume writes work and verify without it.  The constants are kept so
+# the recovered protocol remains documented, but this library never writes
+# 0x0500.
+CONTROL_HOST: Final = 2   # host is applying a change
+CONTROL_LOCAL: Final = 3  # ALSERV's nominal "local control" value
 
 # Hardware limits taken from ALADA.INF / acs495.inf for ADA305 / ADA495.
 # Register value is attenuation in dB; larger is quieter.
@@ -224,7 +229,11 @@ def decode_volume(raw: bytes) -> int:
 
 
 def encode_control(value: int) -> bytes:
-    """Encode the one-byte 0x0500 host/local control handoff value."""
+    """Encode the one-byte 0x0500 host/local handoff value.
+
+    Kept for protocol completeness.  The reference ADA305 stalls this write
+    with ``EPIPE`` and does not need it, so no library operation sends it.
+    """
 
     value = _require_int(value, "control mode")
     if value not in (CONTROL_HOST, CONTROL_LOCAL):
@@ -281,14 +290,21 @@ def decode_mode(state_byte: int, mode_byte: int) -> int:
 # Interrupt-IN reports
 # ---------------------------------------------------------------------------
 
-# Report flags seen in ALSERV's 7-byte ReadFileEx buffer.
+# Report flags confirmed against the reference ADA305 by live capture.
 FLAG_MUTE_TOGGLE: Final = 0x01
 FLAG_MODE_CYCLE: Final = 0x02   # ignored for ADA305/ADA495
 FLAG_UNMUTE: Final = 0x08       # non-ADA305 models
-FLAG_INPUT_4: Final = 0x10      # non-ADA305 input selection
-FLAG_INPUT_3: Final = 0x20      # non-ADA305 input selection
-FLAG_INPUT_7: Final = 0x40      # non-ADA305 input selection
+FLAG_SELECT_SUBWOOFER: Final = 0x10
+FLAG_SELECT_CENTER: Final = 0x20
+FLAG_SELECT_SURROUND: Final = 0x40
 FLAG_RECONNECT: Final = 0x80    # re-read all state
+
+FLAG_SELECTOR_MASK: Final = 0x70
+SELECTOR_CHANNELS: Final = {
+    FLAG_SELECT_SUBWOOFER: "sub",
+    FLAG_SELECT_CENTER: "center",
+    FLAG_SELECT_SURROUND: "surround-left",
+}
 
 
 @dataclass(frozen=True)
@@ -323,10 +339,24 @@ class InterruptReport:
         return bool(self.flags & FLAG_RECONNECT)
 
     @property
-    def input_select(self) -> int:
-        """Return the encoded input-selection bits (0x10/0x20/0x40)."""
+    def selector_flags(self) -> int:
+        """Return the channel-selector bits (``0x10``/``0x20``/``0x40``)."""
 
-        return self.flags & 0x70
+        return self.flags & FLAG_SELECTOR_MASK
+
+    @property
+    def selector_channel(self) -> Optional[Channel]:
+        """Return the selected channel, or ``None`` if no single selector."""
+
+        key = SELECTOR_CHANNELS.get(self.selector_flags)
+        return resolve_channel(key) if key is not None else None
+
+    @property
+    def selector_flag(self) -> Optional[int]:
+        """Return the selector flag bit, or ``None`` if not exactly one."""
+
+        flags = self.selector_flags
+        return flags if flags in SELECTOR_CHANNELS else None
 
 
 def decode_interrupt_report(raw: bytes) -> InterruptReport:

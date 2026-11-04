@@ -14,6 +14,7 @@ from typing import List, Optional, Sequence
 
 from . import __version__, protocol as p
 from .device import Ada305, ChannelReading, DeviceError
+from .follow import Follower, FollowerSettings
 from .safety import (
     LEVEL_MAX,
     LEVEL_MIN,
@@ -104,7 +105,8 @@ examples:
   ada305 mute on                      mute the speakers
   ada305 mute off                     unmute (prints a warning)
   ada305 mute toggle --dry-run        preview a mute toggle
-  ada305 release                      return control to the speaker's knob
+  ada305 follow --allow-increase      apply the speaker's wheel and buttons
+  ada305 release                      explain why 0x0500 is not used
   ada305 monitor --count 5            decode five physical-control reports
 """
     parser = argparse.ArgumentParser(
@@ -157,9 +159,11 @@ examples:
         aliases=["return-control"],
         parents=[common],
         allow_abbrev=False,
-        help="return control to the speaker's own buttons and knob",
-        description="Write register 0x0500 = 3, the value ALSERV sends "
-        "after a host volume change to hand control back to the speaker.",
+        help="explain how control works in USB mode (does not write)",
+        description="This command does not write register 0x0500. That write "
+        "stalls with EPIPE on the reference ADA305 and does not restore the "
+        "physical controls. In USB mode the speaker reports wheel/button "
+        "events but does not apply them; run 'ada305 follow' to apply them.",
     )
     release.set_defaults(func=cmd_release)
 
@@ -230,6 +234,59 @@ examples:
     # attribute of the subparser namespace back over the parent namespace, so
     # a default here would overwrite an earlier `--timeout`.
     monitor.set_defaults(func=cmd_monitor)
+
+    follow = sub.add_parser(
+        "follow",
+        parents=[common],
+        allow_abbrev=False,
+        help="apply physical wheel/button reports (writes volume and mute)",
+        description="In USB mode the speaker reports its wheel and buttons but "
+        "does not apply them itself. This command applies them. Quieter "
+        "clicks always work; louder clicks need --allow-increase, and targets "
+        "above level 90 also need --yes-very-loud.",
+        epilog="""\
+examples:
+  ada305 follow                       quieter clicks only
+  ada305 follow --allow-increase      apply wheel clicks in both directions
+  ada305 follow --allow-increase --yes-very-loud
+  ada305 follow --dry-run             decode events without writing
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    follow.add_argument(
+        "--allow-increase",
+        action="store_true",
+        help="apply wheel clicks that increase volume (otherwise ignored)",
+    )
+    follow.add_argument(
+        "--channel-timeout",
+        type=float,
+        default=3.0,
+        metavar="SECONDS",
+        help="return to master after this much idle time on a channel "
+        "(default 3)",
+    )
+    follow.add_argument(
+        "--debounce",
+        type=float,
+        default=0.35,
+        metavar="SECONDS",
+        help="ignore repeated selector/mute packets within this window "
+        "(default 0.35)",
+    )
+    follow.add_argument(
+        "--count",
+        type=int,
+        default=0,
+        help="stop after N reports (default: run until Ctrl-C)",
+    )
+    follow.add_argument(
+        "--length",
+        type=int,
+        default=None,
+        help="interrupt read length (default: endpoint max packet size)",
+    )
+    follow.set_defaults(func=cmd_follow)
 
     listing = sub.add_parser(
         "list-devices",
@@ -343,17 +400,16 @@ def cmd_mute(device: Ada305, args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_release(device: Ada305, args: argparse.Namespace) -> int:
+def cmd_release(_device: Ada305, _args: argparse.Namespace) -> int:
+    print("No write performed.")
     print(
-        "Returning control to the speaker's local buttons/knob: "
-        "register 0x0500 <- 03."
+        "Register 0x0500 is not a usable control handoff on this ADA305: the "
+        "write stalls with EPIPE, and direct volume writes work without it."
     )
-    if args.dry_run:
-        print("Dry run: not writing.")
-        return 0
-
-    device.return_control()
-    print("Wrote 0x0500 = 3. The speaker's own controls should respond again.")
+    print(
+        "In USB mode the speaker reports its wheel and buttons but does not "
+        "apply them itself. Run 'ada305 follow' to have the host apply them."
+    )
     return 0
 
 
@@ -425,11 +481,92 @@ def _describe_report(report: p.InterruptReport) -> str:
         names.append("mode-cycle (ignored on ADA305)")
     if report.unmute_request:
         names.append("unmute-request (non-ADA305)")
-    if report.input_select:
-        names.append(f"input-select=0x{report.input_select:02X} (non-ADA305)")
+    if report.selector_flags:
+        channel = report.selector_channel
+        if channel is None:
+            names.append(
+                f"channel-select=multiple(0x{report.selector_flags:02X})"
+            )
+        else:
+            names.append(f"channel-select={channel.label}")
     if report.reconnect:
         names.append("reconnect/reinit")
     return ", ".join(names) if names else "none"
+
+
+def cmd_follow(device: Ada305, args: argparse.Namespace) -> int:
+    length = (
+        args.length
+        if args.length is not None
+        else device.interrupt_packet_size
+    )
+    if length <= 0:
+        print("--length must be positive", file=sys.stderr)
+        return 2
+    if args.count < 0:
+        print("--count must not be negative", file=sys.stderr)
+        return 2
+    if args.channel_timeout < 0:
+        print("--channel-timeout must not be negative", file=sys.stderr)
+        return 2
+    if args.debounce < 0:
+        print("--debounce must not be negative", file=sys.stderr)
+        return 2
+
+    settings = FollowerSettings(
+        allow_increase=args.allow_increase,
+        allow_very_loud=args.yes_very_loud,
+        debounce_seconds=args.debounce,
+        channel_timeout_seconds=args.channel_timeout,
+        dry_run=args.dry_run,
+    )
+    follower = Follower(
+        device,
+        settings,
+        warn=lambda message: print(f"WARNING: {message}", file=sys.stderr),
+    )
+
+    print(
+        "Following interrupt-IN endpoint 0x81. The speaker reports physical "
+        "controls; this process applies them."
+    )
+    if args.dry_run:
+        print("Dry run: reports are decoded but nothing is written.")
+    if not args.allow_increase:
+        print(
+            "Volume increases are ignored unless you pass --allow-increase.",
+            file=sys.stderr,
+        )
+    if not args.yes_very_loud:
+        print(
+            f"Targets above level {VERY_LOUD_LEVEL} are refused unless you "
+            "pass --yes-very-loud.",
+            file=sys.stderr,
+        )
+    print("Press a channel selector or turn the wheel; Ctrl-C stops.")
+
+    count = 0
+    try:
+        while args.count == 0 or count < args.count:
+            timeout_ms = follower.read_timeout_ms(args.timeout)
+            try:
+                report = device.read_interrupt(length, timeout_ms)
+            except TransportTimeout:
+                follower.tick()
+                continue
+            except TransportOverflow:
+                print(
+                    "(overflow; report dropped. Use --length "
+                    f"{device.interrupt_packet_size} or a multiple of it.)",
+                    file=sys.stderr,
+                )
+                follower.tick()
+                continue
+            follower.handle_report(report)
+            count += 1
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    return 0
 
 
 def cmd_monitor(device: Ada305, args: argparse.Namespace) -> int:
@@ -446,7 +583,7 @@ def cmd_monitor(device: Ada305, args: argparse.Namespace) -> int:
         "Listening on interrupt-IN endpoint 0x81 with "
         f"{length}-byte reads. Read-only: reports are decoded but never applied."
     )
-    print("Press a speaker button or turn the knob; Ctrl-C stops.")
+    print("Press a speaker button or turn the wheel; Ctrl-C stops.")
     count = 0
     try:
         while args.count == 0 or count < args.count:
@@ -471,8 +608,8 @@ def cmd_monitor(device: Ada305, args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("\nStopped.")
         print(
-            "If the speaker's own controls stay unresponsive, run: "
-            "ada305 release"
+            "Monitoring is read-only. If the wheel/buttons appear dead, that "
+            "is expected while no follower is running; use 'ada305 follow'."
         )
     return 0
 
