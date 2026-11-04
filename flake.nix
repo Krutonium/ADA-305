@@ -20,7 +20,11 @@
             pname = "ada305";
             version = "0.3.0";
             pyproject = true;
-            src = ./.;
+            src = pkgs.lib.cleanSourceWith {
+              src = ./.;
+              # Keep the archival driver tarball out of the build/store path.
+              filter = path: _type: pkgs.lib.baseNameOf path != "archive";
+            };
 
             build-system = [ pkgs.python3Packages.setuptools ];
             propagatedBuildInputs = [
