@@ -1,34 +1,25 @@
-"""Loudness policy for ADA305 volume writes.
+"""Volume-level policy for ADA305 writes.
 
-The hardware range is not enough on its own.  The ADA305 master register is an
-attenuation value where **smaller means louder**, and ``25`` is the absolute
-maximum volume documented by Altec.  This module refuses to write that value,
-puts an extra guard on the loud end of the range, and refuses to increase
-loudness unless the caller passes an explicit opt-in.
+The protocol works in dB attenuation, where a larger value is quieter.  The
+user-facing scale is the inverse: **level 0 is minimum volume** (maximum
+attenuation) and **level 100 is maximum volume** (minimum attenuation).
 
-No function here clamps or coerces an out-of-range value: it raises instead.
+Levels above :data:`VERY_LOUD_LEVEL` (90) require an explicit
+``allow_very_loud`` / ``--yes-very-loud`` opt-in.  No function here clamps a
+value: anything outside 0..100 is rejected.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .protocol import (
-    Channel,
-    HW_MASTER_MAX_DB,
-    HW_MASTER_MIN_DB,
-    ProtocolError,
-    encode_volume,
-    resolve_channel,
-)
+from .protocol import Channel, ProtocolError, encode_volume, resolve_channel
 
-# The hardware maximum is 25 dB attenuation.  The tool never writes it.
-MASTER_WRITABLE_MIN_DB = HW_MASTER_MIN_DB + 1  # 26
+LEVEL_MIN = 0
+LEVEL_MAX = 100
+VERY_LOUD_LEVEL = 90
 
-# Values below this are treated as the loud zone and require --allow-loud even
-# when the change is in the quieter direction.  36 dB is deliberately
-# conservative: it is 11 dB away from the absolute maximum.
-MASTER_LOUD_THRESHOLD_DB = 36
+_SPAN = LEVEL_MAX - LEVEL_MIN
 
 
 class SafetyError(Exception):
@@ -47,12 +38,54 @@ class RangeError(SafetyError):
     pass
 
 
-class LouderNotAllowed(SafetyError):
+class VeryLoudNotAllowed(SafetyError):
     pass
 
 
-class LoudNotAllowed(SafetyError):
-    pass
+def _require_int(value: object, what: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RangeError(f"{what} must be an integer, not {type(value).__name__}")
+    return value
+
+
+def _round_half_up(numerator: int, denominator: int) -> int:
+    return (numerator + denominator // 2) // denominator
+
+
+def level_to_db(channel: Channel, level: int) -> int:
+    """Map a 0..100 volume level to the channel's attenuation in dB.
+
+    Level 0 is the quietest documented value (``channel.max_db``); level 100
+    is the loudest (``channel.min_db``).
+    """
+
+    level = _require_int(level, "volume level")
+    if not LEVEL_MIN <= level <= LEVEL_MAX:
+        raise RangeError(
+            f"volume level {level} is outside {LEVEL_MIN}..{LEVEL_MAX}; "
+            "refusing to clamp"
+        )
+    span = channel.max_db - channel.min_db
+    return channel.max_db - _round_half_up(level * span, _SPAN)
+
+
+def db_to_level(channel: Channel, db: int) -> int:
+    """Map a channel attenuation in dB to the nearest user-facing level.
+
+    The scale has more levels than the hardware has attenuation steps, so
+    several levels can share a dB value.  This returns the lower of the
+    equivalent levels; the CLI reports the effective level after a write.
+    """
+
+    db = _require_int(db, "attenuation")
+    if not channel.min_db <= db <= channel.max_db:
+        raise RangeError(
+            f"{channel.label} attenuation {db} dB is outside "
+            f"{channel.min_db}..{channel.max_db}"
+        )
+    span = channel.max_db - channel.min_db
+    level = ((channel.max_db - db) * _SPAN) // span
+    return max(LEVEL_MIN, min(LEVEL_MAX, level))
 
 
 @dataclass(frozen=True)
@@ -61,12 +94,15 @@ class VolumePlan:
 
     channel: Channel
     current_db: int
+    current_level: int
+    requested_level: int
     requested_db: int
-    allow_louder: bool = False
-    allow_loud: bool = False
+    allow_very_loud: bool = False
 
     @property
     def is_noop(self) -> bool:
+        """True when the requested level maps to the current attenuation."""
+
         return self.requested_db == self.current_db
 
     @property
@@ -86,38 +122,39 @@ class VolumePlan:
         return self.requested_db - self.current_db
 
     @property
+    def is_very_loud(self) -> bool:
+        return self.requested_level > VERY_LOUD_LEVEL
+
+    @property
     def encoded(self) -> bytes:
         return encode_volume(self.requested_db)
 
     def describe(self) -> str:
         if self.is_noop:
-            return f"no change ({self.requested_db} dB attenuation)"
-        direction = "LOUDER" if self.is_louder else "quieter"
+            return (
+                f"no change (level {self.requested_level}, "
+                f"{self.requested_db} dB attenuation)"
+            )
+        direction = "louder" if self.is_louder else "quieter"
         return (
-            f"{direction} by {abs(self.delta_db)} dB "
+            f"{direction}: level {self.current_level} -> "
+            f"{self.requested_level} "
             f"({self.current_db} -> {self.requested_db} dB attenuation)"
         )
 
 
-def _require_int(value: object, what: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise RangeError(f"{what} must be an integer, not {type(value).__name__}")
-    return value
-
-
 def plan_volume(
     channel_name: str,
-    requested_db: int,
+    requested_level: int,
     current_db: int,
     *,
-    allow_louder: bool = False,
-    allow_loud: bool = False,
+    allow_very_loud: bool = False,
 ) -> VolumePlan:
-    """Validate a requested volume change and return a plan.
+    """Validate a requested volume level and return a plan.
 
     Raises :class:`SafetyError` (or a subclass) when the request must not be
-    sent.  The caller is responsible for actually executing the plan and for
-    confirming the current value again immediately before writing.
+    sent.  The caller is responsible for executing the plan; the device layer
+    re-reads the current value immediately before writing.
     """
 
     try:
@@ -125,7 +162,7 @@ def plan_volume(
     except KeyError as exc:
         raise UnknownChannelError(str(exc)) from None
 
-    requested_db = _require_int(requested_db, "requested attenuation")
+    requested_level = _require_int(requested_level, "volume level")
     current_db = _require_int(current_db, "current attenuation")
 
     if not channel.writable:
@@ -136,7 +173,6 @@ def plan_volume(
             f"'--channel {channel.mirror_of}' instead."
         )
 
-    # Never guess about a value outside the documented hardware range.
     if not channel.min_db <= current_db <= channel.max_db:
         raise RangeError(
             f"current {channel.label} attenuation {current_db} dB is outside "
@@ -144,65 +180,55 @@ def plan_volume(
             "refusing to write until this is understood"
         )
 
-    if not channel.min_db <= requested_db <= channel.max_db:
+    if not LEVEL_MIN <= requested_level <= LEVEL_MAX:
         raise RangeError(
-            f"requested {channel.label} attenuation {requested_db} dB is "
-            f"outside the documented range {channel.min_db}.."
-            f"{channel.max_db}; refusing to clamp"
+            f"volume level {requested_level} is outside "
+            f"{LEVEL_MIN}..{LEVEL_MAX}; refusing to clamp"
         )
 
-    if channel.is_master:
-        if requested_db < MASTER_WRITABLE_MIN_DB:
-            raise RangeError(
-                f"{requested_db} dB is the hardware maximum volume on the "
-                f"ADA305 (range {HW_MASTER_MIN_DB}..{HW_MASTER_MAX_DB}); "
-                "the safety policy never writes the maximum"
-            )
-        if requested_db < MASTER_LOUD_THRESHOLD_DB and not allow_loud:
-            raise LoudNotAllowed(
-                f"{requested_db} dB is in the loud zone "
-                f"(< {MASTER_LOUD_THRESHOLD_DB} dB attenuation); pass "
-                "--allow-loud to permit it"
-            )
+    requested_db = level_to_db(channel, requested_level)
+    current_level = db_to_level(channel, current_db)
 
-    if requested_db < current_db and not allow_louder:
-        raise LouderNotAllowed(
-            f"requested {requested_db} dB is louder than the current "
-            f"{current_db} dB (attenuation decreases by "
-            f"{current_db - requested_db} dB); pass --allow-louder to permit it"
+    # A no-op transmits nothing, so it does not need the very-loud opt-in.
+    if (
+        requested_db != current_db
+        and requested_level > VERY_LOUD_LEVEL
+        and not allow_very_loud
+    ):
+        raise VeryLoudNotAllowed(
+            f"volume level {requested_level} is above {VERY_LOUD_LEVEL}; "
+            "pass --yes-very-loud to permit it"
         )
 
     return VolumePlan(
         channel=channel,
         current_db=current_db,
+        current_level=current_level,
+        requested_level=requested_level,
         requested_db=requested_db,
-        allow_louder=allow_louder,
-        allow_loud=allow_loud,
+        allow_very_loud=allow_very_loud,
     )
 
 
 def describe_limits(channel: Channel) -> str:
-    """Human-readable hardware range for status output."""
+    """Human-readable user-facing range for status output."""
 
-    if channel.is_master:
-        return (
-            f"{channel.min_db}..{channel.max_db} dB attenuation "
-            f"(loudest allowed write: {MASTER_WRITABLE_MIN_DB} dB)"
-        )
-    return f"{channel.min_db}..{channel.max_db} dB attenuation"
+    return f"level {LEVEL_MIN}..{LEVEL_MAX} (0 = minimum, 100 = maximum)"
 
 
 __all__ = [
-    "LoudNotAllowed",
-    "LouderNotAllowed",
-    "MASTER_LOUD_THRESHOLD_DB",
-    "MASTER_WRITABLE_MIN_DB",
+    "LEVEL_MAX",
+    "LEVEL_MIN",
     "MirroredChannelError",
     "ProtocolError",
     "RangeError",
     "SafetyError",
     "UnknownChannelError",
+    "VERY_LOUD_LEVEL",
+    "VeryLoudNotAllowed",
     "VolumePlan",
+    "db_to_level",
     "describe_limits",
+    "level_to_db",
     "plan_volume",
 ]

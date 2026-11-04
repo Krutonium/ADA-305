@@ -1,8 +1,7 @@
 """High-level ADA305 device operations.
 
-Reads are always safe.  The only writes exposed here are mute and volume, and
-both require an explicit ``confirm=True`` from the caller.  Volume writes also
-go through :mod:`ada305.safety` and are read back for verification.
+Reads are always safe.  Volume writes go through :mod:`ada305.safety`, use the
+0..100 user-facing scale, and are verified by reading the register back.
 """
 
 from __future__ import annotations
@@ -11,16 +10,17 @@ from dataclasses import dataclass
 from typing import Dict, Mapping, Optional
 
 from . import protocol as p
-from .safety import SafetyError, VolumePlan, plan_volume
+from .safety import (
+    SafetyError,
+    VolumePlan,
+    db_to_level,
+    plan_volume,
+)
 from .transport import Transport
 
 
 class DeviceError(Exception):
     """The device returned data that does not match the protocol."""
-
-
-class WriteNotConfirmed(SafetyError):
-    """A write was attempted without an explicit confirmation."""
 
 
 @dataclass(frozen=True)
@@ -42,6 +42,19 @@ class Status:
 
     def volume_db(self, channel: str) -> int:
         return self.channels[channel].db
+
+    def volume_level(self, channel: str) -> int:
+        reading = self.channels[channel]
+        return db_to_level(reading.channel, reading.db)
+
+
+@dataclass(frozen=True)
+class VolumeResult:
+    """The verified state after a volume operation."""
+
+    level: int
+    db: int
+    changed: bool
 
 
 class Ada305:
@@ -108,7 +121,9 @@ class Ada305:
             )
 
         raw = self._read_volume_raw(channel)
-        return ChannelReading(channel=channel, raw=raw, db=self._decode_db(raw, channel))
+        return ChannelReading(
+            channel=channel, raw=raw, db=self._decode_db(raw, channel)
+        )
 
     def _decode_db(self, raw: bytes, channel: p.Channel) -> int:
         try:
@@ -165,18 +180,14 @@ class Ada305:
 
     # -- writes ----------------------------------------------------------
 
-    def write_mute(self, muted: bool, *, confirm: bool = False) -> bool:
-        """Set mute and verify it.  ``confirm`` must be True to write."""
+    def write_mute(self, muted: bool) -> bool:
+        """Set mute, verify it, and return the read-back state."""
 
         if not isinstance(muted, bool):
             raise DeviceError("muted must be a bool")
         current = self.read_mute()
         if current == muted:
             return current
-        if not confirm:
-            raise WriteNotConfirmed(
-                "mute write not confirmed; pass confirm=True after user approval"
-            )
         target = p.encode_mute(muted)
         self.transport.write_control(p.REQ_REGISTER_WRITE, p.REG_MUTE, target)
         actual = self.read_mute()
@@ -189,12 +200,11 @@ class Ada305:
     def prepare_volume(
         self,
         channel: str,
-        requested_db: int,
+        requested_level: int,
         *,
-        allow_louder: bool = False,
-        allow_loud: bool = False,
+        allow_very_loud: bool = False,
     ) -> VolumePlan:
-        """Read the current value and validate a proposed change."""
+        """Read the current value and validate a proposed 0..100 level."""
 
         try:
             ch = p.resolve_channel(channel)
@@ -205,36 +215,27 @@ class Ada305:
             # reading a register that ADA305 does not use independently.
             return plan_volume(
                 ch.key,
-                requested_db,
-                current_db=ch.min_db,
-                allow_louder=allow_louder,
-                allow_loud=allow_loud,
+                requested_level,
+                current_db=ch.max_db,
+                allow_very_loud=allow_very_loud,
             )
-        current = self.read_channel(ch.key).db
+        current_db = self.read_channel(ch.key).db
         return plan_volume(
             ch.key,
-            requested_db,
-            current,
-            allow_louder=allow_louder,
-            allow_loud=allow_loud,
+            requested_level,
+            current_db,
+            allow_very_loud=allow_very_loud,
         )
 
-    def execute_volume(
-        self, plan: VolumePlan, *, confirm: bool = False
-    ) -> int:
+    def execute_volume(self, plan: VolumePlan) -> VolumeResult:
         """Execute a previously validated plan and verify the read-back.
 
         The current value is re-read immediately before the write.  If it has
         changed since the plan was made, the write is refused.
         """
 
-        if not confirm:
-            raise WriteNotConfirmed(
-                "volume write not confirmed; pass confirm=True after user "
-                "approval"
-            )
         if plan.is_noop:
-            return plan.current_db
+            return VolumeResult(plan.current_level, plan.current_db, False)
 
         actual_current = self.read_channel(plan.channel.key).db
         if actual_current != plan.current_db:
@@ -247,36 +248,39 @@ class Ada305:
         self.transport.write_control(
             p.REQ_REGISTER_WRITE, plan.channel.register, plan.encoded
         )
-        actual = self.read_channel(plan.channel.key).db
-        if actual != plan.requested_db:
+        actual_db = self.read_channel(plan.channel.key).db
+        if actual_db != plan.requested_db:
             raise DeviceError(
                 f"{plan.channel.label} read-back mismatch: requested "
-                f"{plan.requested_db} dB, got {actual} dB"
+                f"{plan.requested_db} dB, got {actual_db} dB"
             )
-        return actual
+        return VolumeResult(
+            level=db_to_level(plan.channel, actual_db),
+            db=actual_db,
+            changed=True,
+        )
 
     def set_volume(
         self,
         channel: str,
-        requested_db: int,
+        requested_level: int,
         *,
-        confirm: bool = False,
-        allow_louder: bool = False,
-        allow_loud: bool = False,
-    ) -> int:
+        allow_very_loud: bool = False,
+    ) -> VolumeResult:
         """Prepare and execute a volume change in one call."""
 
         plan = self.prepare_volume(
             channel,
-            requested_db,
-            allow_louder=allow_louder,
-            allow_loud=allow_loud,
+            requested_level,
+            allow_very_loud=allow_very_loud,
         )
-        return self.execute_volume(plan, confirm=confirm)
+        return self.execute_volume(plan)
 
     # -- interrupt monitor ----------------------------------------------
 
-    def read_interrupt(self, length: int = 7, timeout_ms: int = 5000) -> p.InterruptReport:
+    def read_interrupt(
+        self, length: int = 7, timeout_ms: int = 5000
+    ) -> p.InterruptReport:
         raw = self.transport.read_interrupt(length, timeout_ms)
         return p.decode_interrupt_report(raw)
 
@@ -286,5 +290,5 @@ __all__ = [
     "ChannelReading",
     "DeviceError",
     "Status",
-    "WriteNotConfirmed",
+    "VolumeResult",
 ]

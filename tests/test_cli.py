@@ -22,6 +22,7 @@ def test_default_command_is_read_only_status(monkeypatch, transport, capsys):
     assert transport.writes == []
     out = capsys.readouterr().out
     assert "Master:" in out
+    assert "56/100" in out
     assert "56 dB" in out
 
 
@@ -30,7 +31,9 @@ def test_status_json(monkeypatch, transport, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["mute"] is False
     assert payload["mode"] == 0
+    assert payload["channels"]["master"]["level"] == 56
     assert payload["channels"]["master"]["db"] == 56
+    assert payload["channels"]["master"]["very_loud"] is False
     assert payload["channels"]["surround-right"]["mirrored"] is True
     assert transport.writes == []
 
@@ -41,35 +44,57 @@ def test_raw_read_is_read_only(monkeypatch, transport, capsys):
     assert transport.writes == []
 
 
-def test_volume_louder_without_flag_is_refused(monkeypatch, transport, capsys):
-    assert run(monkeypatch, transport, ["volume", "master", "40"]) == 3
+def test_volume_increase_writes_without_extra_flag(monkeypatch, transport):
+    # 56 -> 60 is louder (60 dB -> 53 dB attenuation); no --yes is needed.
+    assert run(monkeypatch, transport, ["volume", "master", "60"]) == 0
+    assert transport.writes == [
+        (p.REQ_REGISTER_WRITE, p.REG_VOLUME_BASE, b"\x00\x35")
+    ]
+
+
+def test_volume_increase_prints_warning(monkeypatch, transport, capsys):
+    assert run(monkeypatch, transport, ["volume", "master", "60"]) == 0
+    assert "INCREASE" in capsys.readouterr().err
+
+
+def test_level_90_is_allowed_without_opt_in(monkeypatch, transport):
+    assert run(monkeypatch, transport, ["volume", "master", "90"]) == 0
+    assert transport.writes == [
+        (p.REQ_REGISTER_WRITE, p.REG_VOLUME_BASE, b"\x00\x20")
+    ]
+
+
+def test_level_91_is_refused_without_opt_in(monkeypatch, transport, capsys):
+    assert run(monkeypatch, transport, ["volume", "master", "91"]) == 3
     assert transport.writes == []
-    assert "refusing" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "refusing" in err
+    assert "--yes-very-loud" in err
 
 
-def test_volume_louder_with_flag_but_without_yes_is_refused(
-    monkeypatch, transport, capsys
-):
+def test_level_91_with_opt_in_writes(monkeypatch, transport):
     assert (
-        run(monkeypatch, transport, ["volume", "master", "40", "--allow-louder"])
-        == 3
-    )
-    assert transport.writes == []
-    assert "--yes" in capsys.readouterr().err
-
-
-def test_volume_louder_with_both_flags_writes_once(monkeypatch, transport):
-    assert (
-        run(
-            monkeypatch,
-            transport,
-            ["volume", "master", "40", "--allow-louder", "--yes"],
-        )
+        run(monkeypatch, transport, ["volume", "master", "91", "--yes-very-loud"])
         == 0
     )
     assert transport.writes == [
-        (p.REQ_REGISTER_WRITE, p.REG_VOLUME_BASE, b"\x00\x28")
+        (p.REQ_REGISTER_WRITE, p.REG_VOLUME_BASE, b"\x00\x1f")
     ]
+
+
+def test_level_100_with_opt_in_writes_maximum(monkeypatch, transport):
+    assert (
+        run(monkeypatch, transport, ["volume", "master", "100", "--yes-very-loud"])
+        == 0
+    )
+    assert transport.writes == [
+        (p.REQ_REGISTER_WRITE, p.REG_VOLUME_BASE, b"\x00\x19")
+    ]
+
+
+def test_level_100_without_opt_in_is_refused(monkeypatch, transport):
+    assert run(monkeypatch, transport, ["volume", "master", "100"]) == 3
+    assert transport.writes == []
 
 
 def test_option_before_subcommand_is_honoured(monkeypatch, transport):
@@ -77,7 +102,7 @@ def test_option_before_subcommand_is_honoured(monkeypatch, transport):
         run(
             monkeypatch,
             transport,
-            ["--yes", "volume", "master", "40", "--allow-louder"],
+            ["--yes-very-loud", "volume", "master", "91"],
         )
         == 0
     )
@@ -89,15 +114,15 @@ def test_option_after_subcommand_is_honoured(monkeypatch, transport):
         run(
             monkeypatch,
             transport,
-            ["volume", "master", "40", "--allow-louder", "--yes"],
+            ["volume", "master", "91", "--yes-very-loud"],
         )
         == 0
     )
     assert len(transport.writes) == 1
 
 
-def test_quieter_volume_with_yes_writes(monkeypatch, transport):
-    assert run(monkeypatch, transport, ["volume", "master", "60", "--yes"]) == 0
+def test_quieter_volume_writes(monkeypatch, transport):
+    assert run(monkeypatch, transport, ["volume", "master", "50"]) == 0
     assert transport.writes == [
         (p.REQ_REGISTER_WRITE, p.REG_VOLUME_BASE, b"\x00\x3c")
     ]
@@ -105,57 +130,47 @@ def test_quieter_volume_with_yes_writes(monkeypatch, transport):
 
 def test_volume_dry_run_never_writes(monkeypatch, transport, capsys):
     assert (
-        run(
-            monkeypatch,
-            transport,
-            ["volume", "master", "60", "--yes", "--dry-run"],
-        )
-        == 0
+        run(monkeypatch, transport, ["volume", "master", "50", "--dry-run"]) == 0
     )
     assert transport.writes == []
     assert "Dry run" in capsys.readouterr().out
 
 
-def test_maximum_volume_refused_with_every_flag(monkeypatch, transport, capsys):
+def test_very_loud_dry_run_needs_no_opt_in(monkeypatch, transport, capsys):
     assert (
-        run(
-            monkeypatch,
-            transport,
-            [
-                "volume",
-                "master",
-                "25",
-                "--allow-louder",
-                "--allow-loud",
-                "--yes",
-            ],
-        )
-        == 3
+        run(monkeypatch, transport, ["volume", "master", "100", "--dry-run"]) == 3
     )
     assert transport.writes == []
-    assert "maximum" in capsys.readouterr().err
+    assert "--yes-very-loud" in capsys.readouterr().err
 
 
 def test_volume_noop_does_not_write(monkeypatch, transport, capsys):
-    assert run(monkeypatch, transport, ["volume", "master", "56", "--yes"]) == 0
+    assert run(monkeypatch, transport, ["volume", "master", "56"]) == 0
     assert transport.writes == []
     assert "No change" in capsys.readouterr().out
 
 
-def test_mute_without_yes_is_refused(monkeypatch, transport):
-    assert run(monkeypatch, transport, ["mute", "on"]) == 3
+def test_very_loud_noop_does_not_need_opt_in(monkeypatch, transport):
+    transport.registers[p.REG_VOLUME_BASE] = b"\x00\x19"  # master already 100
+    assert run(monkeypatch, transport, ["volume", "master", "100"]) == 0
     assert transport.writes == []
 
 
-def test_mute_with_yes_writes(monkeypatch, transport):
-    assert run(monkeypatch, transport, ["mute", "on", "--yes"]) == 0
+def test_out_of_range_level_is_refused(monkeypatch, transport, capsys):
+    assert run(monkeypatch, transport, ["volume", "master", "101"]) == 3
+    assert transport.writes == []
+    assert "0..100" in capsys.readouterr().err
+
+
+def test_mute_writes_without_confirmation(monkeypatch, transport):
+    assert run(monkeypatch, transport, ["mute", "on"]) == 0
     assert transport.writes == [
         (p.REQ_REGISTER_WRITE, p.REG_MUTE, b"\x01")
     ]
 
 
 def test_mute_off_when_already_unmuted_is_noop(monkeypatch, transport):
-    assert run(monkeypatch, transport, ["mute", "off", "--yes"]) == 0
+    assert run(monkeypatch, transport, ["mute", "off"]) == 0
     assert transport.writes == []
 
 
@@ -174,10 +189,22 @@ def test_common_defaults_are_applied():
     assert args.bus is None
     assert args.address is None
     assert args.timeout == 2000
-    assert args.yes is False
+    assert args.yes_very_loud is False
     assert args.dry_run is False
-    assert args.allow_louder is False
-    assert args.allow_loud is False
+    assert not hasattr(args, "yes")
+    assert not hasattr(args, "allow_louder")
+    assert not hasattr(args, "allow_loud")
+
+
+def test_removed_flags_are_rejected():
+    parser = cli.build_parser()
+    for flag in ("--yes", "--allow-louder", "--allow-loud"):
+        try:
+            parser.parse_args(["volume", "master", "50", flag])
+        except SystemExit as exc:
+            assert exc.code == 2
+        else:
+            raise AssertionError(f"{flag} should no longer be accepted")
 
 
 def test_transport_is_closed(monkeypatch, transport):
@@ -186,9 +213,15 @@ def test_transport_is_closed(monkeypatch, transport):
 
 
 def test_unknown_channel_is_a_refusal(monkeypatch, transport, capsys):
-    assert run(monkeypatch, transport, ["volume", "rear", "40", "--yes"]) == 3
+    assert run(monkeypatch, transport, ["volume", "rear", "40"]) == 3
     assert transport.writes == []
     assert "unknown channel" in capsys.readouterr().err
+
+
+def test_surround_right_is_refused(monkeypatch, transport, capsys):
+    assert run(monkeypatch, transport, ["volume", "surround-right", "50"]) == 3
+    assert transport.writes == []
+    assert "mirrors" in capsys.readouterr().err
 
 
 def test_list_devices_does_not_open_a_device(monkeypatch, transport, capsys):

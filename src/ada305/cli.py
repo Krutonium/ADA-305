@@ -1,8 +1,8 @@
 """Command-line interface for the Altec Lansing ADA305.
 
-Default behaviour is read-only.  Any write requires ``--yes`` on the command
-line; volume increases additionally require ``--allow-louder`` and the loud
-end of the master range requires ``--allow-loud``.
+Volumes use a 0..100 level: 0 is minimum volume, 100 is maximum.  The default
+command is read-only; levels above 90 require ``--yes-very-loud``.  Volume
+increases print a warning, and every write is verified by reading it back.
 """
 
 from __future__ import annotations
@@ -12,12 +12,14 @@ import json
 import sys
 from typing import List, Optional, Sequence
 
-from . import protocol as p
-from .device import Ada305, DeviceError
+from . import __version__, protocol as p
+from .device import Ada305, ChannelReading, DeviceError
 from .safety import (
+    LEVEL_MAX,
+    LEVEL_MIN,
+    VERY_LOUD_LEVEL,
     SafetyError,
-    describe_limits,
-    MASTER_LOUD_THRESHOLD_DB,
+    db_to_level,
 )
 from .transport import (
     PyUsbTransport,
@@ -30,10 +32,8 @@ DEFAULTS = {
     "bus": None,
     "address": None,
     "timeout": 2000,
-    "yes": False,
     "dry_run": False,
-    "allow_louder": False,
-    "allow_loud": False,
+    "yes_very_loud": False,
     "verbose": False,
 }
 
@@ -48,31 +48,46 @@ def _parse_int(text: str) -> int:
 
 
 def _common_options() -> argparse.ArgumentParser:
-    common = argparse.ArgumentParser(add_help=False)
+    common = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     # SUPPRESS keeps a value given before the subcommand from being clobbered
     # by the subparser's defaults.
-    common.add_argument("--bus", type=int, default=argparse.SUPPRESS,
-                        help="USB bus number (see list-devices)")
-    common.add_argument("--address", type=int, default=argparse.SUPPRESS,
-                        help="USB device address (see list-devices)")
-    common.add_argument("--timeout", type=int, default=argparse.SUPPRESS,
-                        metavar="MS", help="USB timeout in milliseconds "
-                                           "(default 2000)")
-    common.add_argument("--yes", action="store_true", default=argparse.SUPPRESS,
-                        help="actually perform the requested write")
-    common.add_argument("--dry-run", action="store_true",
-                        default=argparse.SUPPRESS,
-                        help="show the encoded request but do not write")
-    common.add_argument("--allow-louder", action="store_true",
-                        default=argparse.SUPPRESS,
-                        help="permit a volume change that increases loudness")
-    common.add_argument("--allow-loud", action="store_true",
-                        default=argparse.SUPPRESS,
-                        help=f"permit master attenuation below "
-                             f"{MASTER_LOUD_THRESHOLD_DB} dB (loud zone)")
-    common.add_argument("--verbose", action="store_true",
-                        default=argparse.SUPPRESS,
-                        help="show raw register bytes")
+    common.add_argument(
+        "--bus",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="USB bus number (see list-devices)",
+    )
+    common.add_argument(
+        "--address",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="USB device address (see list-devices)",
+    )
+    common.add_argument(
+        "--timeout",
+        type=int,
+        default=argparse.SUPPRESS,
+        metavar="MS",
+        help="USB timeout in milliseconds (default 2000)",
+    )
+    common.add_argument(
+        "--yes-very-loud",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=f"permit volume levels above {VERY_LOUD_LEVEL} (91-100)",
+    )
+    common.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="show the encoded request but do not write",
+    )
+    common.add_argument(
+        "--verbose",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="show raw register bytes",
+    )
     return common
 
 
@@ -80,61 +95,104 @@ def build_parser() -> argparse.ArgumentParser:
     common = _common_options()
     parser = argparse.ArgumentParser(
         prog="ada305",
-        description="Safe control for Altec Lansing ADA305 USB speakers. "
-                    "Read-only unless a write command is given with --yes.",
+        description="Control Altec Lansing ADA305 USB speakers. "
+        "Volume is 0-100 (0 = minimum, 100 = maximum). "
+        "Read-only unless a write command is given.",
         parents=[common],
+        allow_abbrev=False,
     )
-    parser.add_argument("--version", action="version", version="ada305 0.1.0")
+    parser.add_argument(
+        "--version", action="version", version=f"ada305 {__version__}"
+    )
     sub = parser.add_subparsers(dest="command")
 
     status = sub.add_parser(
-        "status", aliases=["info"], parents=[common],
+        "status",
+        aliases=["info"],
+        parents=[common],
+        allow_abbrev=False,
         help="read mute, volume, and mode (default)",
     )
-    status.add_argument("--json", action="store_true",
-                        help="machine-readable output")
+    status.add_argument(
+        "--json", action="store_true", help="machine-readable output"
+    )
     status.set_defaults(func=cmd_status)
 
-    mute = sub.add_parser("mute", parents=[common],
-                          help="read or set the hardware mute bit")
-    mute.add_argument("state", choices=("on", "off", "toggle"),
-                      help="mute state to apply")
+    mute = sub.add_parser(
+        "mute", parents=[common], allow_abbrev=False,
+        help="read or set the hardware mute bit"
+    )
+    mute.add_argument(
+        "state", choices=("on", "off", "toggle"), help="mute state to apply"
+    )
     mute.set_defaults(func=cmd_mute)
 
-    volume = sub.add_parser("volume", parents=[common],
-                            help="read or set a channel's attenuation in dB")
-    volume.add_argument("channel", help="master, left, right, center, sub, "
-                                        "surround-left (aliases accepted)")
-    volume.add_argument("db", type=int,
-                        help="attenuation in dB (higher = quieter); an "
-                             "integer, never a percentage")
+    volume = sub.add_parser(
+        "volume",
+        parents=[common],
+        allow_abbrev=False,
+        help="set a channel's volume level (0-100)",
+    )
+    volume.add_argument(
+        "channel",
+        help="master, left, right, center, sub, surround-left "
+        "(aliases accepted)",
+    )
+    volume.add_argument(
+        "level",
+        type=int,
+        metavar="LEVEL",
+        help=f"volume level {LEVEL_MIN}-{LEVEL_MAX} "
+        f"(0 = minimum, {LEVEL_MAX} = maximum)",
+    )
     volume.set_defaults(func=cmd_volume)
 
-    raw = sub.add_parser("raw-read", parents=[common],
-                         help="read an arbitrary register (read-only)")
-    raw.add_argument("register", type=_parse_int,
-                     help="register address, decimal or 0x-prefixed")
-    raw.add_argument("--length", type=int, default=1,
-                     help="number of bytes to read (default 1)")
+    raw = sub.add_parser(
+        "raw-read",
+        parents=[common],
+        allow_abbrev=False,
+        help="read an arbitrary register (read-only)",
+    )
+    raw.add_argument(
+        "register",
+        type=_parse_int,
+        help="register address, decimal or 0x-prefixed",
+    )
+    raw.add_argument(
+        "--length", type=int, default=1, help="number of bytes to read (default 1)"
+    )
     raw.set_defaults(func=cmd_raw_read)
 
-    monitor = sub.add_parser("monitor", parents=[common],
-                             help="decode interrupt-IN reports (read-only; "
-                                  "never applies them)")
-    monitor.add_argument("--count", type=int, default=0,
-                         help="stop after N reports (default: run until "
-                              "Ctrl-C)")
-    monitor.add_argument("--length", type=int, default=7,
-                         help="interrupt read length (default 7, matching "
-                              "ALSERV; ADA305 uses the first 2 bytes)")
+    monitor = sub.add_parser(
+        "monitor",
+        parents=[common],
+        allow_abbrev=False,
+        help="decode interrupt-IN reports (read-only; never applies them)",
+    )
+    monitor.add_argument(
+        "--count",
+        type=int,
+        default=0,
+        help="stop after N reports (default: run until Ctrl-C)",
+    )
+    monitor.add_argument(
+        "--length",
+        type=int,
+        default=7,
+        help="interrupt read length (default 7, matching ALSERV; "
+        "ADA305 uses the first 2 bytes)",
+    )
     # Do not give this parser its own timeout default: argparse copies every
     # attribute of the subparser namespace back over the parent namespace, so
     # a default here would overwrite an earlier `--timeout`.
     monitor.set_defaults(func=cmd_monitor)
 
-    listing = sub.add_parser("list-devices", parents=[common],
-                             help="list matching USB devices without opening "
-                                  "them")
+    listing = sub.add_parser(
+        "list-devices",
+        parents=[common],
+        allow_abbrev=False,
+        help="list matching USB devices without opening them",
+    )
     listing.set_defaults(func=None)
 
     parser.set_defaults(command="status", func=cmd_status)
@@ -149,6 +207,10 @@ def _apply_defaults(args: argparse.Namespace) -> None:
 
 def _device_description(device: Ada305) -> str:
     return getattr(device.transport, "description", "ADA305")
+
+
+def _level_for(reading: ChannelReading) -> int:
+    return db_to_level(reading.channel, reading.db)
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +229,9 @@ def cmd_status(device: Ada305, args: argparse.Namespace) -> int:
             "mode_byte": status.mode_byte,
             "channels": {
                 key: {
+                    "level": _level_for(reading),
                     "db": reading.db,
+                    "very_loud": _level_for(reading) > VERY_LOUD_LEVEL,
                     "register": f"0x{reading.channel.register:03X}",
                     "mirrored": reading.mirrored,
                     "source": reading.source,
@@ -180,17 +244,27 @@ def cmd_status(device: Ada305, args: argparse.Namespace) -> int:
 
     print(_device_description(device))
     print(f"{'Mute:':<17}{'on' if status.mute else 'off'}")
-    print(f"{'Mode:':<17}{status.mode} "
-          f"(state byte {status.mode_state}, mode byte {status.mode_byte})")
+    print(
+        f"{'Mode:':<17}{status.mode} "
+        f"(state byte {status.mode_state}, mode byte {status.mode_byte})"
+    )
+    print(f"{'Volume:':<17}0 = minimum, {LEVEL_MAX} = maximum")
     for channel in p.CHANNELS:
         reading = status.channels[channel.key]
+        level = _level_for(reading)
         if channel.mirror_of is not None:
-            print(f"{channel.label + ':':<17}mirrors {channel.mirror_of} "
-                  f"({reading.db} dB); register 0x{channel.register:03X} is "
-                  f"not an independent ADA305 control")
+            print(
+                f"{channel.label + ':':<17}mirrors {channel.mirror_of} "
+                f"(level {level}/{LEVEL_MAX}, {reading.db} dB); register "
+                f"0x{channel.register:03X} is not an independent ADA305 control"
+            )
             continue
-        line = (f"{channel.label + ':':<17}{reading.db:3d} dB attenuation  "
-                f"[{describe_limits(channel)}]")
+        line = (
+            f"{channel.label + ':':<17}{level:3d}/{LEVEL_MAX}  "
+            f"({reading.db:2d} dB attenuation)"
+        )
+        if level > VERY_LOUD_LEVEL:
+            line += "  [very loud]"
         if getattr(args, "verbose", False):
             line += f"  raw={reading.raw.hex(' ')}"
         print(line)
@@ -216,48 +290,60 @@ def cmd_mute(device: Ada305, args: argparse.Namespace) -> int:
     if args.dry_run:
         print("Dry run: not writing.")
         return 0
-    if not args.yes:
-        print("Refusing to write without --yes. Nothing sent.", file=sys.stderr)
-        return 3
 
-    actual = device.write_mute(target, confirm=True)
-    print(f"Wrote mute {'on' if target else 'off'}; "
-          f"read-back {'on' if actual else 'off'}.")
+    actual = device.write_mute(target)
+    print(
+        f"Wrote mute {'on' if target else 'off'}; "
+        f"read-back {'on' if actual else 'off'}."
+    )
     return 0
 
 
 def cmd_volume(device: Ada305, args: argparse.Namespace) -> int:
     plan = device.prepare_volume(
         args.channel,
-        args.db,
-        allow_louder=args.allow_louder,
-        allow_loud=args.allow_loud,
+        args.level,
+        allow_very_loud=args.yes_very_loud,
     )
 
-    print(f"Current {plan.channel.label}: {plan.current_db} dB attenuation")
-    print(f"Requested:         {plan.requested_db} dB attenuation "
-          f"({plan.describe()})")
-    print(f"Register:          0x{plan.channel.register:03X} <- "
-          f"{plan.encoded.hex(' ')}")
+    print(
+        f"Current {plan.channel.label}: level {plan.current_level}/{LEVEL_MAX} "
+        f"({plan.current_db} dB attenuation)"
+    )
+    print(
+        f"Requested:         level {plan.requested_level}/{LEVEL_MAX} "
+        f"({plan.requested_db} dB attenuation)"
+    )
+    print(f"Change:            {plan.describe()}")
+    print(
+        f"Register:          0x{plan.channel.register:03X} <- "
+        f"{plan.encoded.hex(' ')}"
+    )
 
     if plan.is_noop:
         print("No change; nothing to write.")
         return 0
     if plan.is_louder:
-        print("WARNING: this is a volume INCREASE (more loudness).",
-              file=sys.stderr)
+        print(
+            "WARNING: this is a volume INCREASE (more loudness).",
+            file=sys.stderr,
+        )
+    if plan.is_very_loud:
+        print(
+            f"WARNING: level {plan.requested_level} is above "
+            f"{VERY_LOUD_LEVEL} (very loud).",
+            file=sys.stderr,
+        )
 
     if args.dry_run:
         print("Dry run: not writing.")
         return 0
-    if not args.yes:
-        print("Refusing to write without --yes. Nothing sent.",
-              file=sys.stderr)
-        return 3
 
-    actual = device.execute_volume(plan, confirm=True)
-    print(f"Wrote {len(plan.encoded)} byte(s); read-back {actual} dB "
-          f"attenuation.")
+    result = device.execute_volume(plan)
+    print(
+        f"Wrote {len(plan.encoded)} byte(s); read-back level "
+        f"{result.level}/{LEVEL_MAX} ({result.db} dB attenuation)."
+    )
     return 0
 
 
@@ -266,8 +352,10 @@ def cmd_raw_read(device: Ada305, args: argparse.Namespace) -> int:
         print("length must be non-negative", file=sys.stderr)
         return 2
     raw = device.read_register(args.register, args.length)
-    print(f"register 0x{args.register:04X} length {args.length}: "
-          f"{raw.hex(' ') if raw else '(empty)'}")
+    print(
+        f"register 0x{args.register:04X} length {args.length}: "
+        f"{raw.hex(' ') if raw else '(empty)'}"
+    )
     return 0
 
 
@@ -280,16 +368,17 @@ def _describe_report(report: p.InterruptReport) -> str:
     if report.unmute_request:
         names.append("unmute-request (non-ADA305)")
     if report.input_select:
-        names.append(f"input-select=0x{report.input_select:02X} "
-                     f"(non-ADA305)")
+        names.append(f"input-select=0x{report.input_select:02X} (non-ADA305)")
     if report.reconnect:
         names.append("reconnect/reinit")
     return ", ".join(names) if names else "none"
 
 
 def cmd_monitor(device: Ada305, args: argparse.Namespace) -> int:
-    print("Listening on interrupt-IN endpoint 0x81. Read-only: reports are "
-          "decoded but never applied.")
+    print(
+        "Listening on interrupt-IN endpoint 0x81. Read-only: reports are "
+        "decoded but never applied."
+    )
     print("Press a speaker button or turn the knob; Ctrl-C stops.")
     count = 0
     try:
@@ -299,9 +388,11 @@ def cmd_monitor(device: Ada305, args: argparse.Namespace) -> int:
             except TransportTimeout:
                 print("(timeout; still listening)")
                 continue
-            print(f"raw={report.raw.hex(' ') if report.raw else '(none)':<24} "
-                  f"flags=0x{report.flags:02X} delta={report.volume_delta:+d} "
-                  f"dB  {_describe_report(report)}")
+            print(
+                f"raw={report.raw.hex(' ') if report.raw else '(none)':<24} "
+                f"flags=0x{report.flags:02X} delta={report.volume_delta:+d} "
+                f"dB  {_describe_report(report)}"
+            )
             count += 1
     except KeyboardInterrupt:
         print("\nStopped.")

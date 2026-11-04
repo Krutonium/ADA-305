@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 
 from ada305 import protocol as p
-from ada305.device import DeviceError, WriteNotConfirmed
-from ada305.safety import LouderNotAllowed, MirroredChannelError, RangeError
+from ada305.device import Ada305, DeviceError
+from ada305.safety import MirroredChannelError, VeryLoudNotAllowed
 
 
 def test_read_status_is_read_only(device, transport):
@@ -15,7 +15,8 @@ def test_read_status_is_read_only(device, transport):
     assert status.mute is False
     assert status.mode == 0
     assert status.volume_db("master") == 56
-    assert status.volume_db("surround-left") == 31
+    assert status.volume_level("master") == 56
+    assert status.volume_level("surround-left") == 0
     # surround-right mirrors surround-left and never reads 0x206.
     assert status.channels["surround-right"].mirrored is True
     assert status.channels["surround-right"].db == 31
@@ -30,99 +31,109 @@ def test_read_channel_mirror_does_not_read_0x206(device, transport):
 
 
 def test_read_status_rejects_out_of_range_value(transport):
-    from ada305.device import Ada305
-
     transport.registers[p.REG_VOLUME_BASE + 1] = b"\x00\xff"
     with pytest.raises(DeviceError):
         Ada305(transport).read_status()
 
 
 def test_read_status_rejects_malformed_volume(transport):
-    from ada305.device import Ada305
-
     transport.registers[p.REG_VOLUME_BASE + 1] = b"\x01\x00"
     with pytest.raises(DeviceError):
         Ada305(transport).read_status()
 
 
-def test_mute_write_requires_confirmation(device, transport):
-    with pytest.raises(WriteNotConfirmed):
-        device.write_mute(True)
-    assert transport.writes == []
-
-
 def test_mute_write_encodes_and_verifies(device, transport):
-    assert device.write_mute(True, confirm=True) is True
-    assert transport.writes == [
-        (p.REQ_REGISTER_WRITE, p.REG_MUTE, b"\x01")
-    ]
+    assert device.write_mute(True) is True
+    assert transport.writes == [(p.REQ_REGISTER_WRITE, p.REG_MUTE, b"\x01")]
 
 
 def test_mute_noop_write_is_skipped(device, transport):
-    assert device.write_mute(False, confirm=True) is False
+    assert device.write_mute(False) is False
     assert transport.writes == []
 
 
 def test_volume_noop_does_not_write(device, transport):
     plan = device.prepare_volume("master", 56)
     assert plan.is_noop
-    assert device.execute_volume(plan, confirm=True) == 56
-    assert transport.writes == []
-
-
-def test_volume_write_requires_confirmation(device, transport):
-    plan = device.prepare_volume("master", 60)
-    with pytest.raises(WriteNotConfirmed):
-        device.execute_volume(plan)
+    result = device.execute_volume(plan)
+    assert result.changed is False
+    assert result.level == 56
+    assert result.db == 56
     assert transport.writes == []
 
 
 def test_quieter_volume_write_encoding(device, transport):
-    plan = device.prepare_volume("master", 60)
+    plan = device.prepare_volume("master", 50)
+    assert plan.requested_db == 60
     assert plan.encoded == b"\x00\x3c"
-    assert device.execute_volume(plan, confirm=True) == 60
+    result = device.execute_volume(plan)
+    assert result.level == 50
+    assert result.db == 60
+    assert result.changed is True
     assert transport.writes == [
         (p.REQ_REGISTER_WRITE, p.REG_VOLUME_BASE, b"\x00\x3c")
     ]
 
 
-def test_louder_volume_refused_without_flag(device, transport):
-    with pytest.raises(LouderNotAllowed):
-        device.prepare_volume("master", 40)
-    assert transport.writes == []
-
-
-def test_louder_volume_allowed_with_flag(device, transport):
-    plan = device.prepare_volume("master", 40, allow_louder=True)
+def test_louder_volume_is_allowed_by_default(device, transport):
+    plan = device.prepare_volume("master", 60)
     assert plan.is_louder
-    assert device.execute_volume(plan, confirm=True) == 40
-    assert transport.writes[-1][2] == b"\x00\x28"
+    assert plan.encoded == b"\x00\x35"
+    result = device.execute_volume(plan)
+    assert result.level == 60
+    assert result.db == 53
+    assert transport.writes[-1][2] == b"\x00\x35"
 
 
-def test_maximum_volume_refused_even_with_every_flag(device, transport):
-    with pytest.raises(RangeError):
-        device.prepare_volume(
-            "master", 25, allow_louder=True, allow_loud=True
-        )
+def test_level_90_is_allowed_without_opt_in(device, transport):
+    plan = device.prepare_volume("master", 90)
+    assert plan.requested_db == 32
+    assert device.execute_volume(plan).db == 32
+
+
+def test_level_91_requires_opt_in(device, transport):
+    with pytest.raises(VeryLoudNotAllowed):
+        device.prepare_volume("master", 91)
     assert transport.writes == []
+
+
+def test_level_91_with_opt_in_writes(device, transport):
+    plan = device.prepare_volume("master", 91, allow_very_loud=True)
+    result = device.execute_volume(plan)
+    assert result.level == 91
+    assert result.db == 31
+    assert transport.writes == [
+        (p.REQ_REGISTER_WRITE, p.REG_VOLUME_BASE, b"\x00\x1f")
+    ]
+
+
+def test_level_100_with_opt_in_writes_maximum(device, transport):
+    plan = device.prepare_volume("master", 100, allow_very_loud=True)
+    result = device.execute_volume(plan)
+    assert result.level == 100
+    assert result.db == 25
+    assert transport.writes == [
+        (p.REQ_REGISTER_WRITE, p.REG_VOLUME_BASE, b"\x00\x19")
+    ]
 
 
 def test_mirrored_channel_refused(device, transport):
     with pytest.raises(MirroredChannelError):
-        device.prepare_volume("surround-right", 10, allow_louder=True)
+        device.prepare_volume("surround-right", 50)
+    assert transport.writes == []
 
 
 def test_write_refused_if_value_changed_while_planning(device, transport):
-    plan = device.prepare_volume("master", 60)
+    plan = device.prepare_volume("master", 50)
     transport.registers[p.REG_VOLUME_BASE] = b"\x00\x50"
     with pytest.raises(Exception) as excinfo:
-        device.execute_volume(plan, confirm=True)
+        device.execute_volume(plan)
     assert "changed" in str(excinfo.value)
     assert transport.writes == []
 
 
 def test_read_back_mismatch_is_an_error(device, transport):
-    plan = device.prepare_volume("master", 60)
+    plan = device.prepare_volume("master", 50)
 
     original_write = transport.write_control
 
@@ -133,4 +144,4 @@ def test_read_back_mismatch_is_an_error(device, transport):
 
     transport.write_control = lying_write
     with pytest.raises(DeviceError):
-        device.execute_volume(plan, confirm=True)
+        device.execute_volume(plan)

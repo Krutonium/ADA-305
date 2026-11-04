@@ -9,6 +9,11 @@ invitation to write to them with this tool.
 > The INF files call the value at minimum volume `Min` and the value at maximum
 > volume `Max`, which is inverted relative to attenuation. Both are shown
 > explicitly to avoid that trap.
+>
+> The CLI and library expose a per-model `0..100` level instead: `0` is the
+> quietest `MaxDb` value and `100` is the loudest `MinDb` value. For the ADA305
+> that means master `0 = 96 dB`, `100 = 25 dB`, and channels `0 = 31 dB`,
+> `100 = 0 dB`. Any model added later needs the same explicit mapping.
 
 ---
 

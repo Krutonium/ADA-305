@@ -1,57 +1,113 @@
-"""Loudness-policy tests.  These never touch a device."""
+"""Volume-level policy tests.  These never touch a device."""
 
 from __future__ import annotations
 
 import pytest
 
 from ada305 import safety
-from ada305.protocol import HW_MASTER_MAX_DB, HW_MASTER_MIN_DB
+from ada305.protocol import resolve_channel
 
 
-def plan(requested, current=56, channel="master", **kwargs):
-    return safety.plan_volume(channel, requested, current, **kwargs)
+MASTER = resolve_channel("master")
+LEFT = resolve_channel("left")
 
 
-def test_master_hardware_maximum_is_never_writable():
-    # 25 dB attenuation is the documented maximum volume.
-    assert HW_MASTER_MIN_DB == 25
+def plan(level, current=56, channel="master", **kwargs):
+    return safety.plan_volume(channel, level, current, **kwargs)
+
+
+def test_master_level_endpoints():
+    assert safety.level_to_db(MASTER, 0) == 96
+    assert safety.level_to_db(MASTER, 100) == 25
+    assert safety.level_to_db(MASTER, 50) == 60
+    assert safety.level_to_db(MASTER, 56) == 56
+    assert safety.level_to_db(MASTER, 90) == 32
+    assert safety.level_to_db(MASTER, 91) == 31
+
+
+def test_channel_level_endpoints():
+    assert safety.level_to_db(LEFT, 0) == 31
+    assert safety.level_to_db(LEFT, 100) == 0
+    assert safety.level_to_db(LEFT, 50) == 15
+    assert safety.level_to_db(LEFT, 90) == 3
+
+
+def test_level_is_monotonic_in_both_directions():
+    for channel in (MASTER, LEFT):
+        values = [safety.level_to_db(channel, n) for n in range(101)]
+        assert values == sorted(values, reverse=True)
+        assert set(values) <= set(range(channel.min_db, channel.max_db + 1))
+
+
+def test_db_to_level_endpoints():
+    assert safety.db_to_level(MASTER, 96) == 0
+    assert safety.db_to_level(MASTER, 25) == 100
+    assert safety.db_to_level(MASTER, 56) == 56
+    assert safety.db_to_level(MASTER, 60) == 50
+    assert safety.db_to_level(LEFT, 31) == 0
+    assert safety.db_to_level(LEFT, 0) == 100
+
+
+@pytest.mark.parametrize("bad", [-1, 101, 1000])
+def test_level_out_of_range_is_refused(bad):
     with pytest.raises(safety.RangeError):
-        plan(25, current=56, allow_louder=True, allow_loud=True)
-    # The very next step is allowed only with both flags.
-    assert plan(26, current=56, allow_louder=True, allow_loud=True).requested_db == 26
-
-
-def test_master_loud_zone_requires_allow_loud():
-    with pytest.raises(safety.LoudNotAllowed):
-        plan(30, current=56, allow_louder=True)
-    assert plan(30, current=56, allow_louder=True, allow_loud=True).requested_db == 30
-
-
-def test_master_loud_threshold_boundary():
-    assert plan(36, current=56, allow_louder=True).requested_db == 36
-    with pytest.raises(safety.LoudNotAllowed):
-        plan(35, current=56, allow_louder=True)
-
-
-def test_master_quieter_is_allowed_without_extra_flags():
-    result = plan(96, current=56)
-    assert result.is_quieter is True
-    assert result.delta_db == 40
-
-
-def test_louder_requires_allow_louder():
-    with pytest.raises(safety.LouderNotAllowed):
-        plan(40, current=56)
-    result = plan(40, current=56, allow_louder=True)
-    assert result.is_louder is True
-    assert result.delta_db == -16
-
-
-def test_channel_range_is_not_clamped():
+        safety.level_to_db(MASTER, bad)
     with pytest.raises(safety.RangeError):
-        plan(32, current=0, channel="left")
+        plan(bad)
+
+
+@pytest.mark.parametrize("bad", [True, False, 50.0, "50", None])
+def test_level_must_be_an_int(bad):
     with pytest.raises(safety.RangeError):
-        plan(-1, current=0, channel="left")
+        plan(bad)
+
+
+def test_level_90_is_allowed_without_opt_in():
+    result = plan(90)
+    assert result.requested_level == 90
+    assert result.requested_db == 32
+    assert result.is_very_loud is False
+
+
+def test_level_91_requires_very_loud_opt_in():
+    with pytest.raises(safety.VeryLoudNotAllowed):
+        plan(91)
+    result = plan(91, allow_very_loud=True)
+    assert result.requested_db == 31
+    assert result.is_very_loud is True
+
+
+def test_level_100_requires_very_loud_opt_in():
+    with pytest.raises(safety.VeryLoudNotAllowed):
+        plan(100)
+    result = plan(100, allow_very_loud=True)
+    assert result.requested_db == 25
+    assert result.is_very_loud is True
+
+
+def test_very_loud_noop_is_allowed_without_opt_in():
+    result = plan(100, current=25)
+    assert result.is_noop is True
+    assert result.is_very_loud is True
+
+
+def test_very_loud_guard_applies_to_channels_too():
+    with pytest.raises(safety.VeryLoudNotAllowed):
+        plan(91, current=15, channel="left")
+    result = plan(91, current=15, channel="left", allow_very_loud=True)
+    assert result.requested_db == 3
+
+
+def test_quieter_and_louder_directions():
+    quieter = plan(50)
+    assert quieter.is_quieter is True
+    assert quieter.is_louder is False
+    assert quieter.delta_db == 4  # 56 -> 60 dB attenuation
+
+    louder = plan(60)
+    assert louder.is_louder is True
+    assert louder.is_quieter is False
+    assert louder.delta_db == -3  # 56 -> 53 dB attenuation
 
 
 def test_current_value_outside_range_is_refused():
@@ -59,33 +115,24 @@ def test_current_value_outside_range_is_refused():
         plan(50, current=200, channel="left")
 
 
-def test_master_range_is_documented_range():
-    with pytest.raises(safety.RangeError):
-        plan(HW_MASTER_MAX_DB + 1, current=56)
-    with pytest.raises(safety.RangeError):
-        plan(HW_MASTER_MIN_DB - 1, current=56)
-
-
 def test_surround_right_is_refused_as_independently_writable():
     with pytest.raises(safety.MirroredChannelError):
-        plan(10, current=10, channel="surround-right")
+        plan(50, current=15, channel="surround-right")
 
 
 def test_unknown_channel():
     with pytest.raises(safety.UnknownChannelError):
-        plan(40, current=56, channel="rear")
-
-
-def test_non_int_values_are_refused():
-    with pytest.raises(safety.RangeError):
-        plan("40", current=56)
-    with pytest.raises(safety.RangeError):
-        plan(40, current="56")
-    with pytest.raises(safety.RangeError):
-        plan(True, current=56)
+        plan(50, channel="rear")
 
 
 def test_noop_plan():
-    result = plan(56, current=56)
+    result = plan(56)
     assert result.is_noop is True
     assert result.describe().startswith("no change")
+
+
+def test_describe_limits():
+    text = safety.describe_limits(MASTER)
+    assert "0..100" in text
+    assert "minimum" in text
+    assert "maximum" in text

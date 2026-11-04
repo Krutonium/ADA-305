@@ -148,8 +148,28 @@ FrontLeftMaxDb=31
 ...
 ```
 
-The tool refuses to write master `25` (hardware maximum volume) and requires an
-extra opt-in below `36` dB. It does not clamp.
+### User-facing 0..100 levels
+
+The CLI and library do not expose attenuation directly. They map it to a linear
+`0..100` level where **`0` is minimum volume** and **`100` is maximum volume**.
+The mapping is per channel because the two hardware ranges differ:
+
+| Channel | Level `0` | Level `50` | Level `100` |
+| --- | --- | --- | --- |
+| Master | `96` dB | `60` dB | `25` dB |
+| Left/right/center/sub/surround | `31` dB | `15` dB | `0` dB |
+
+`level_to_db` rounds half-up, and `db_to_level` floors. The master scale has
+`101` levels across `72` attenuation steps, so several levels map to the same
+dB value; status output reports the effective level after a write. No value is
+ever clamped: a level outside `0..100` is refused.
+
+Changes whose target level is `91..100` require an explicit
+`--yes-very-loud` / `allow_very_loud=True`. A request that maps to the current
+attenuation is a no-op, sends nothing, and does not require the opt-in.
+Volume increases print a warning but need no additional flag. `100` maps to the
+hardware maximum volume (`25` dB master attenuation); it is writable only with
+the very-loud opt-in.
 
 ---
 
@@ -237,17 +257,18 @@ covered by unit tests.
 ## 7. Safety invariants implemented by this library
 
 1. Reads only unless a specific write command is given.
-2. Every write requires `confirm=True` in the library and `--yes` in the CLI.
-3. Volume increases require `allow_louder=True` / `--allow-louder`.
-4. Master values below `36` dB require `allow_loud=True` / `--allow-loud`.
-5. Master `25` dB (hardware maximum) is always refused.
-6. Out-of-range values, unknown channels, and malformed register bytes are
-   errors, never clamped or guessed.
-7. `execute_volume` re-reads the current value immediately before the write and
+2. Writes are validated against the documented attenuation range; unknown
+   channels and malformed register bytes are errors.
+3. Volume levels use `0..100` (`0` = minimum, `100` = maximum) and are never
+   clamped.
+4. Target levels above `90` require `allow_very_loud=True` / `--yes-very-loud`,
+   unless the request is a no-op that sends nothing.
+5. Volume increases print a warning; they need no additional flag.
+6. `execute_volume` re-reads the current value immediately before the write and
    aborts if it changed after planning.
-8. Every write is read back and must match exactly.
-9. No startup/reset/initialise write is performed.
-10. The interrupt monitor never writes.
+7. Every write is read back and must match exactly.
+8. No startup/reset/initialise write is performed.
+9. The interrupt monitor never writes.
 
 ---
 
