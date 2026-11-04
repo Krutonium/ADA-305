@@ -1,8 +1,9 @@
 """Command-line interface for the Altec Lansing ADA305.
 
 Volumes use a 0..100 level: 0 is minimum volume, 100 is maximum.  The default
-command is read-only; levels above 90 require ``--yes-very-loud``.  Volume
-increases print a warning, and every write is verified by reading it back.
+command is read-only; digital changes to levels above 90 require
+``--yes-very-loud``.  Every write is verified by reading it back.  The physical
+follower applies wheel clicks in either direction without extra opt-ins.
 """
 
 from __future__ import annotations
@@ -105,7 +106,7 @@ examples:
   ada305 mute on                      mute the speakers
   ada305 mute off                     unmute (prints a warning)
   ada305 mute toggle --dry-run        preview a mute toggle
-  ada305 follow --allow-increase      apply the speaker's wheel and buttons
+  ada305 follow                       apply the speaker's wheel and buttons
   ada305 release                      explain why 0x0500 is not used
   ada305 monitor --count 5            decode five physical-control reports
 """
@@ -241,22 +242,22 @@ examples:
         allow_abbrev=False,
         help="apply physical wheel/button reports (writes volume and mute)",
         description="In USB mode the speaker reports its wheel and buttons but "
-        "does not apply them itself. This command applies them. Quieter "
-        "clicks always work; louder clicks need --allow-increase, and targets "
-        "above level 90 also need --yes-very-loud.",
+        "does not apply them itself. This command applies them in both "
+        "directions. Physical wheel clicks are direct user actions, so no "
+        "extra opt-in is needed; only the digital volume command gates "
+        "very loud levels.",
         epilog="""\
 examples:
-  ada305 follow                       quieter clicks only
-  ada305 follow --allow-increase      apply wheel clicks in both directions
-  ada305 follow --allow-increase --yes-very-loud
+  ada305 follow                       apply wheel clicks and buttons
   ada305 follow --dry-run             decode events without writing
+  ada305 follow --wheel-debounce 0.6  tolerate a slower wheel
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     follow.add_argument(
         "--allow-increase",
         action="store_true",
-        help="apply wheel clicks that increase volume (otherwise ignored)",
+        help="deprecated and ignored; physical increases are always applied",
     )
     follow.add_argument(
         "--channel-timeout",
@@ -525,8 +526,6 @@ def cmd_follow(device: Ada305, args: argparse.Namespace) -> int:
         return 2
 
     settings = FollowerSettings(
-        allow_increase=args.allow_increase,
-        allow_very_loud=args.yes_very_loud,
         debounce_seconds=args.debounce,
         wheel_debounce_seconds=args.wheel_debounce,
         channel_timeout_seconds=args.channel_timeout,
@@ -540,21 +539,10 @@ def cmd_follow(device: Ada305, args: argparse.Namespace) -> int:
 
     print(
         "Following interrupt-IN endpoint 0x81. The speaker reports physical "
-        "controls; this process applies them."
+        "controls; this process applies them in both directions."
     )
     if args.dry_run:
         print("Dry run: reports are decoded but nothing is written.")
-    if not args.allow_increase:
-        print(
-            "Volume increases are ignored unless you pass --allow-increase.",
-            file=sys.stderr,
-        )
-    if not args.yes_very_loud:
-        print(
-            f"Targets above level {VERY_LOUD_LEVEL} are refused unless you "
-            "pass --yes-very-loud.",
-            file=sys.stderr,
-        )
     print("Press a channel selector or turn the wheel; Ctrl-C stops.")
 
     count = 0

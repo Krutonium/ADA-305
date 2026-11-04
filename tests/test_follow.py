@@ -42,7 +42,7 @@ def warnings():
 def follower(device, clock, logs, warnings) -> Follower:
     return Follower(
         device,
-        FollowerSettings(allow_increase=False, allow_very_loud=True),
+        FollowerSettings(),
         clock=clock,
         log=logs.append,
         warn=warnings.append,
@@ -70,58 +70,42 @@ def test_master_quieter_click_writes_one_db(device, transport, follower):
     assert follower.active_key == "master"
 
 
-def test_louder_click_is_ignored_without_opt_in(
+def test_louder_click_applies_without_opt_in(
     device, transport, follower, warnings, logs
 ):
-    follower.handle_report(report(delta=1))
-    assert transport.writes == []
-    assert any("allow-increase" in message for message in warnings)
-    assert logs == []
-
-
-def test_louder_click_applies_with_opt_in(
-    device, transport, clock, logs, warnings
-):
-    follower = make_follower(
-        device, clock, logs, warnings, allow_increase=True
-    )
     follower.handle_report(report(delta=1))
     assert transport.writes == [
         (p.REQ_REGISTER_WRITE, p.REG_VOLUME_BASE, b"\x00\x37")
     ]
+    assert warnings == []
+    assert any("louder" in message for message in logs)
 
 
-def test_very_loud_target_needs_its_own_opt_in(
+def test_wheel_delta_larger_than_one_is_ignored(
+    device, transport, clock, logs, warnings
+):
+    follower = make_follower(device, clock, logs, warnings)
+    follower.handle_report(report(delta=60))
+    assert transport.writes == []
+    assert any("unexpected wheel delta" in message for message in warnings)
+
+
+def test_very_loud_target_applies_without_opt_in(
     device, transport, clock, logs, warnings
 ):
     transport.registers[p.REG_VOLUME_BASE] = b"\x00\x20"  # level 90
-    follower = make_follower(
-        device, clock, logs, warnings, allow_increase=True
-    )
-    follower.handle_report(report(delta=1))
-    assert transport.writes == []
-    assert any("--yes-very-loud" in message for message in warnings)
-
-    follower = make_follower(
-        device,
-        clock,
-        logs,
-        warnings,
-        allow_increase=True,
-        allow_very_loud=True,
-    )
+    follower = make_follower(device, clock, logs, warnings)
     follower.handle_report(report(delta=1))
     assert transport.writes == [
         (p.REQ_REGISTER_WRITE, p.REG_VOLUME_BASE, b"\x00\x1f")
     ]
+    assert warnings == []
 
 
 def test_click_past_hardware_limit_is_ignored(
     device, transport, clock, logs, warnings
 ):
-    follower = make_follower(
-        device, clock, logs, warnings, allow_increase=True
-    )
+    follower = make_follower(device, clock, logs, warnings)
     # Center is at 0 dB: already the loudest documented value.
     follower.handle_report(report(p.FLAG_SELECT_CENTER))
     followed = transport.writes[:]
@@ -136,10 +120,10 @@ def test_dry_run_never_writes(device, transport, clock, logs, warnings):
         clock,
         logs,
         warnings,
-        allow_increase=True,
         dry_run=True,
     )
     follower.handle_report(report(delta=-1))
+    clock.advance(0.5)
     follower.handle_report(report(delta=1))
     assert transport.writes == []
     assert any("[dry-run]" in message for message in logs)
@@ -168,9 +152,7 @@ def test_repeated_wheel_packets_from_one_detent_are_coalesced(
 def test_opposite_packet_in_a_wheel_burst_is_ignored(
     device, transport, clock, logs, warnings
 ):
-    follower = make_follower(
-        device, clock, logs, warnings, allow_increase=True
-    )
+    follower = make_follower(device, clock, logs, warnings)
     follower.handle_report(report(delta=-1))
     clock.advance(0.1)
     follower.handle_report(report(delta=1))
@@ -229,9 +211,7 @@ def test_channel_selection_times_out(device, clock, logs, warnings):
 
 
 def test_volume_change_resets_channel_timeout(device, clock, logs, warnings):
-    follower = make_follower(
-        device, clock, logs, warnings, allow_very_loud=True
-    )
+    follower = make_follower(device, clock, logs, warnings)
     follower.handle_report(report(p.FLAG_SELECT_CENTER))
     clock.advance(2.0)
     follower.handle_report(report(delta=-1))

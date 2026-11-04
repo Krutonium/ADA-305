@@ -310,7 +310,7 @@ def test_follow_applies_selector_and_wheel(monkeypatch, transport, capsys):
         run(
             monkeypatch,
             transport,
-            ["follow", "--count", "2", "--yes-very-loud"],
+            ["follow", "--count", "2"],
         )
         == 0
     )
@@ -321,16 +321,20 @@ def test_follow_applies_selector_and_wheel(monkeypatch, transport, capsys):
     assert "Subwoofer selected" in out
 
 
-def test_follow_ignores_louder_click_by_default(
+def test_follow_applies_louder_click_without_flags(
     monkeypatch, transport, capsys
 ):
     transport.interrupt_reports = [b"\x00\x01"]
     assert run(monkeypatch, transport, ["follow", "--count", "1"]) == 0
-    assert transport.writes == []
-    assert "--allow-increase" in capsys.readouterr().err
+    assert transport.writes == [
+        (p.REQ_REGISTER_WRITE, p.REG_VOLUME_BASE, b"\x00\x37")
+    ]
+    assert "--allow-increase" not in capsys.readouterr().err
 
 
-def test_follow_allows_louder_click_with_flag(monkeypatch, transport):
+def test_follow_still_accepts_deprecated_allow_increase_flag(
+    monkeypatch, transport
+):
     transport.interrupt_reports = [b"\x00\x01"]
     assert (
         run(
@@ -355,8 +359,6 @@ def test_follow_dry_run_never_writes(monkeypatch, transport, capsys):
                 "follow",
                 "--count",
                 "3",
-                "--allow-increase",
-                "--yes-very-loud",
                 "--dry-run",
             ],
         )

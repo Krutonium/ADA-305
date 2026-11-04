@@ -25,14 +25,14 @@ This tool is not:
 | --- | --- |
 | Default action | `ada305` with no subcommand reads status and exits. |
 | No clamping | Out-of-range or unknown values raise; they are never coerced. |
-| Very loud levels need `--yes-very-loud` | Any change whose target is level `91..100` is refused without it. |
-| Increases print a warning | A change that lowers attenuation warns on stderr, then proceeds. |
+| Very loud digital levels need `--yes-very-loud` | Any `ada305 volume` change whose target is level `91..100` is refused without it. |
+| Digital increases print a warning | A `volume` change that lowers attenuation warns on stderr, then proceeds. |
 | No-op writes are skipped | A request that maps to the current attenuation sends nothing. |
 | No hidden initialisation | The tool never resets, re-initialises, or writes at startup. |
 | Direct volume writes | Volume writes go straight to `0x0200+n`; the `0x0500 = 2/3` bracket ALSERV uses stalls with `EPIPE` on this unit and is not sent. |
 | Read-back verification | Every write is read back; a mismatch is an error. |
 | Interrupt monitor is read-only | Physical-control reports are decoded, never applied. |
-| Follower is explicit and gated | `ada305 follow` applies wheel clicks; louder clicks need `--allow-increase`, and targets above level 90 also need `--yes-very-loud`. |
+| Follower applies physical controls | `ada305 follow` applies wheel clicks in both directions with no extra opt-in, because they are direct user actions. It still rejects non-`±1` deltas and out-of-range steps. |
 | Tests never touch hardware | All tests use `FakeTransport`; there is no opt-in live test. |
 
 A no-op at level `91..100` is allowed without the flag because it sends
@@ -179,22 +179,27 @@ only reports them on interrupt-IN endpoint `0x81`; the host must apply them.
 That is why turning the wheel can click while nothing changes when only a
 read-only monitor is running.
 
-`follow` applies those reports:
+`follow` applies those reports in both directions. Physical wheel clicks are
+direct user actions, so there are no permission flags:
 
 ```sh
-# Quieter wheel clicks only; louder clicks are ignored.
+# Apply wheel clicks and buttons.
 python3 -m ada305 follow
 
-# Apply wheel clicks in both directions.
-python3 -m ada305 follow --allow-increase
-
-# Also permit targets above level 90.
-python3 -m ada305 follow --allow-increase --yes-very-loud
+# Decode events without writing.
+python3 -m ada305 follow --dry-run
 ```
+
+The digital `volume` command still gates levels above 90 with
+`--yes-very-loud`; that gate is not applied to the physical wheel.
 
 Press a channel selector to route the wheel to subwoofer, center, or surround;
 press the same selector again (or wait three seconds after the last volume
 change) to return the wheel to master. The mute combination toggles mute.
+
+Wheel reports are only accepted with a delta of `+1` or `-1`. The speaker has
+emitted spurious idle reports such as `00 3c` (delta `+60`); those are ignored
+instead of causing a large jump.
 
 The follower is a foreground process; stop it with Ctrl-C. It applies each
 wheel click directly and verifies the read-back. One physical detent emits
@@ -263,11 +268,9 @@ with PyUsbTransport.open() as transport:
     # Apply one exact attenuation step (the physical-control primitive).
     print(device.write_channel_db("master", 61))
 
-    # Apply reported wheel/button events with explicit safety policy.
-    follower = Follower(
-        device,
-        FollowerSettings(allow_increase=True, allow_very_loud=False),
-    )
+    # Apply reported physical wheel/button events. Physical increases are
+    # direct user actions, so the follower needs no opt-in.
+    follower = Follower(device, FollowerSettings())
     report = device.read_interrupt(timeout_ms=2000)
     follower.handle_report(report)
 ```
@@ -295,7 +298,8 @@ nix-shell -p 'python3.withPackages (ps: [ ps.pytest ps.pyusb ])' --run \
 
 The suite covers codecs, channel aliases, the 0..100 mapping, every range and
 very-loud refusal, no-op handling, exact write encodings, direct writes,
-follower debounce and channel timeouts, interrupt buffer rounding and overflow
+follower wheel/selector/mute debounce, physical increase handling, rejection of
+anomalous wheel deltas, channel timeouts, interrupt buffer rounding and overflow
 handling, read-back mismatches, and CLI option placement. No test opens a real
 USB device, and there is no test that performs a real volume write.
 

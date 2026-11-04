@@ -169,7 +169,9 @@ Changes whose target level is `91..100` require an explicit
 attenuation is a no-op, sends nothing, and does not require the opt-in.
 Volume increases print a warning but need no additional flag. `100` maps to the
 hardware maximum volume (`25` dB master attenuation); it is writable only with
-the very-loud opt-in.
+the very-loud opt-in. These rules apply to host-initiated volume changes such as
+`ada305 volume` and `Ada305.prepare_volume`. Physical wheel reports are direct
+user actions and are handled separately in section 9.
 
 ---
 
@@ -301,8 +303,9 @@ raw=00 3c   flags=0x00   delta=+60
 
 If that were applied naively to master `56`, the result would be `56 - 60 = -4`;
 ALSERV's clamp would take it to `25` dB — the hardware maximum. `ada305
-monitor` therefore only decodes reports and never applies them, and `ada305
-follow` refuses changes outside the documented range and gates loud targets.
+monitor` therefore only decodes reports and never applies them. `ada305 follow`
+accepts only real wheel deltas (`+1` / `-1`) and refuses changes outside the
+documented range.
 
 ---
 
@@ -313,10 +316,13 @@ follow` refuses changes outside the documented range and gates loud targets.
    channels and malformed register bytes are errors.
 3. Volume levels use `0..100` (`0` = minimum, `100` = maximum) and are never
    clamped.
-4. Target levels above `90` require `allow_very_loud=True` / `--yes-very-loud`,
-   unless the request is a no-op that sends nothing.
-5. Explicit volume commands print a warning for increases. The follower ignores
-   increases unless `allow_increase=True` / `--allow-increase` is given.
+4. Host-initiated target levels above `90` require
+   `allow_very_loud=True` / `--yes-very-loud`, unless the request is a no-op
+   that sends nothing. Physical wheel increases are not host-initiated volume
+   commands and do not need this opt-in.
+5. Explicit digital volume commands print a warning for increases. The follower
+   applies physical wheel clicks in both directions without an opt-in, but it
+   accepts only deltas of `+1` or `-1` and rejects out-of-range steps.
 6. `execute_volume` re-reads the current value immediately before the write and
    aborts if it changed after planning.
 7. Volume writes are direct writes to `0x0200+n`. Register `0x0500` is never
@@ -324,7 +330,7 @@ follow` refuses changes outside the documented range and gates loud targets.
 8. Every write is read back and must match exactly.
 9. No startup/reset/initialise write is performed.
 10. The interrupt monitor never writes. `follow` is the explicit command that
-    applies reports, with the gates above.
+    applies reports, with the range and delta validation above.
 
 ---
 
@@ -337,11 +343,13 @@ follow` refuses changes outside the documented range and gates loud targets.
   by default).
 * Three seconds after the last volume change on a selected channel, the
   follower returns to master, matching the AMS help text and ALSERV's timer.
-* Each wheel report is one attenuation step: `new = current - delta`. One
-  physical detent repeats the same report two or three times, so wheel packets
-  within 0.4 s are coalesced into one step (`--wheel-debounce`). The follower
-  reads the current value, ignores a step outside the channel range, writes the
-  new value directly, and verifies it.
+* Each wheel report is one attenuation step: `new = current - delta`. Only
+  deltas of `+1` / `-1` are accepted; larger deltas (including the spurious
+  `00 3c` idle report) are ignored. One physical detent repeats the same report
+  two or three times, so wheel packets within 0.4 s are coalesced into one step
+  (`--wheel-debounce`). The follower reads the current value, applies clicks in
+  either direction without an opt-in, ignores a step outside the channel range,
+  writes the new value directly, and verifies it.
 * A debounced `01` toggles mute.
 * `80` drops the selection, re-reads mute/mode, and returns to master.
 

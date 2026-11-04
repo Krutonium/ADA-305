@@ -14,10 +14,11 @@ apply them with control writes.  :class:`Follower` implements that loop:
 * ``01`` toggles mute.  Repeated packets for one press are debounced.
 * ``80`` means reconnect: drop the active selection and re-read the device.
 
-Safety is explicit: quieter clicks are always applied; louder clicks need
-``allow_increase``; targets above level 90 additionally need
-``allow_very_loud``.  Nothing is ever clamped: a click that would leave the
-documented attenuation range is ignored.
+Safety is explicit: physical wheel clicks in either direction are applied as
+asked, because they are direct user actions rather than host-initiated volume
+changes.  Nothing is ever clamped: a click that would leave the documented
+attenuation range is ignored.  The digital ``volume`` command keeps its own
+very-loud opt-in.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ from typing import Callable, Dict, Optional
 
 from . import protocol as p
 from .device import Ada305, DeviceError
-from .safety import LEVEL_MAX, VERY_LOUD_LEVEL, SafetyError, db_to_level
+from .safety import LEVEL_MAX, SafetyError, db_to_level
 from .transport import TransportError
 
 
@@ -36,8 +37,6 @@ from .transport import TransportError
 class FollowerSettings:
     """Policy and timing for :class:`Follower`."""
 
-    allow_increase: bool = False
-    allow_very_loud: bool = False
     debounce_seconds: float = 0.35
     wheel_debounce_seconds: float = 0.4
     channel_timeout_seconds: float = 3.0
@@ -204,6 +203,17 @@ class Follower:
         self._log(f"mute {'on' if actual else 'off'}")
 
     def _handle_wheel(self, delta: int, now: float) -> None:
+        # The ADA305 wheel emits only +1 / -1.  Larger deltas have been seen
+        # from spurious idle reports (for example 00 3c, +60); applying one
+        # would make a huge unrequested jump, so reject them.
+        if delta not in (-1, 1):
+            self._warn_once(
+                "wheel-delta",
+                f"ignoring unexpected wheel delta {delta:+d}; "
+                "the ADA305 wheel reports only +1 or -1",
+            )
+            return
+
         # One detent reports the same delta two or three times in a burst.
         # Coalesce the burst so one physical click makes one volume step.
         if (
@@ -235,21 +245,6 @@ class Follower:
 
         louder = target_db < current_db
         target_level = db_to_level(channel, target_db)
-
-        if louder and not self.settings.allow_increase:
-            self._warn_once(
-                "increase",
-                f"louder click ignored for {channel.label}; "
-                "pass --allow-increase to permit volume increases",
-            )
-            return
-        if target_level > VERY_LOUD_LEVEL and not self.settings.allow_very_loud:
-            self._warn_once(
-                "very-loud",
-                f"{channel.label} target level {target_level} is above "
-                f"{VERY_LOUD_LEVEL}; pass --yes-very-loud to permit it",
-            )
-            return
 
         if self.settings.dry_run:
             self._log(
