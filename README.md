@@ -1,5 +1,7 @@
 # ADA305 — safe Linux control for Altec Lansing USB speakers
 
+![Altec Lansing ADA305 speakers](Speakers.jpg)
+
 A small Python library and CLI for the Altec Lansing **ADA305** USB speaker
 control link, reconstructed from the original Windows driver stack by static
 analysis. It is intentionally conservative: the default command is read-only,
