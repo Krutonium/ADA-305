@@ -305,6 +305,9 @@ USB device, and there is no test that performs a real volume write.
   volume encoding, mode/state logic, interrupt reports, and evidence.
 * [`docs/MODELS.md`](docs/MODELS.md) — ADA310/600/315/355/495 and legacy
   profiles, with ranges and what is (not) implemented.
+* [`archive/`](archive/) — archival tarball of the original AMS24 installer
+  and the two-disk ADA305 driver set, with hashes. Those binaries remain the
+  property of their original authors; the project source is separate.
 
 ## Limitations
 
