@@ -9,11 +9,13 @@ Volumes are exposed as a 0..100 level: 0 is minimum volume, 100 is maximum.
 The wire protocol still uses dB attenuation.  See ``docs/PROTOCOL.md``.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 from .device import Ada305, DeviceError, Status, VolumeResult
 from .protocol import (
     CHANNELS,
+    CONTROL_HOST,
+    CONTROL_LOCAL,
     Channel,
     PID_ADA305,
     PID_ADA495,
@@ -22,6 +24,7 @@ from .protocol import (
     decode_mode,
     decode_mute,
     decode_volume,
+    encode_control,
     encode_mute,
     encode_volume,
     resolve_channel,
@@ -37,11 +40,19 @@ from .safety import (
     level_to_db,
     plan_volume,
 )
-from .transport import PyUsbTransport, Transport, TransportError, TransportTimeout
+from .transport import (
+    PyUsbTransport,
+    Transport,
+    TransportError,
+    TransportOverflow,
+    TransportTimeout,
+)
 
 __all__ = [
     "Ada305",
     "CHANNELS",
+    "CONTROL_HOST",
+    "CONTROL_LOCAL",
     "Channel",
     "DeviceError",
     "LEVEL_MAX",
@@ -53,6 +64,7 @@ __all__ = [
     "Status",
     "Transport",
     "TransportError",
+    "TransportOverflow",
     "TransportTimeout",
     "VERY_LOUD_LEVEL",
     "VID_ALTEC",
@@ -65,6 +77,7 @@ __all__ = [
     "decode_mode",
     "decode_mute",
     "decode_volume",
+    "encode_control",
     "encode_mute",
     "encode_volume",
     "level_to_db",

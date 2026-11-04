@@ -24,6 +24,7 @@ from .safety import (
 from .transport import (
     PyUsbTransport,
     TransportError,
+    TransportOverflow,
     TransportTimeout,
     enumerate_devices,
 )
@@ -93,11 +94,26 @@ def _common_options() -> argparse.ArgumentParser:
 
 def build_parser() -> argparse.ArgumentParser:
     common = _common_options()
+    examples = """\
+examples:
+  ada305 status                       read mute, volume, and mode
+  ada305 status --json                machine-readable status
+  ada305 volume master 50             set master to 50/100
+  ada305 volume left 80 --dry-run     show the request without writing
+  ada305 volume master 95 --yes-very-loud
+  ada305 mute on                      mute the speakers
+  ada305 mute off                     unmute (prints a warning)
+  ada305 mute toggle --dry-run        preview a mute toggle
+  ada305 release                      return control to the speaker's knob
+  ada305 monitor --count 5            decode five physical-control reports
+"""
     parser = argparse.ArgumentParser(
         prog="ada305",
         description="Control Altec Lansing ADA305 USB speakers. "
         "Volume is 0-100 (0 = minimum, 100 = maximum). "
         "Read-only unless a write command is given.",
+        epilog=examples,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         parents=[common],
         allow_abbrev=False,
     )
@@ -119,19 +135,46 @@ def build_parser() -> argparse.ArgumentParser:
     status.set_defaults(func=cmd_status)
 
     mute = sub.add_parser(
-        "mute", parents=[common], allow_abbrev=False,
-        help="read or set the hardware mute bit"
+        "mute",
+        parents=[common],
+        allow_abbrev=False,
+        help="read or set the hardware mute bit",
+        epilog="""\
+examples:
+  ada305 mute on
+  ada305 mute off
+  ada305 mute toggle --dry-run
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     mute.add_argument(
         "state", choices=("on", "off", "toggle"), help="mute state to apply"
     )
     mute.set_defaults(func=cmd_mute)
 
+    release = sub.add_parser(
+        "release",
+        aliases=["return-control"],
+        parents=[common],
+        allow_abbrev=False,
+        help="return control to the speaker's own buttons and knob",
+        description="Write register 0x0500 = 3, the value ALSERV sends "
+        "after a host volume change to hand control back to the speaker.",
+    )
+    release.set_defaults(func=cmd_release)
+
     volume = sub.add_parser(
         "volume",
         parents=[common],
         allow_abbrev=False,
         help="set a channel's volume level (0-100)",
+        epilog="""\
+examples:
+  ada305 volume master 50
+  ada305 volume left 80 --dry-run
+  ada305 volume master 95 --yes-very-loud
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     volume.add_argument(
         "channel",
@@ -178,9 +221,10 @@ def build_parser() -> argparse.ArgumentParser:
     monitor.add_argument(
         "--length",
         type=int,
-        default=7,
-        help="interrupt read length (default 7, matching ALSERV; "
-        "ADA305 uses the first 2 bytes)",
+        default=None,
+        help="interrupt read length (default: the endpoint max packet size, "
+        "2 on ADA305; ALSERV's 7-byte layout is a Windows buffer, not the "
+        "USB packet size)",
     )
     # Do not give this parser its own timeout default: argparse copies every
     # attribute of the subparser namespace back over the parent namespace, so
@@ -299,6 +343,20 @@ def cmd_mute(device: Ada305, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_release(device: Ada305, args: argparse.Namespace) -> int:
+    print(
+        "Returning control to the speaker's local buttons/knob: "
+        "register 0x0500 <- 03."
+    )
+    if args.dry_run:
+        print("Dry run: not writing.")
+        return 0
+
+    device.return_control()
+    print("Wrote 0x0500 = 3. The speaker's own controls should respond again.")
+    return 0
+
+
 def cmd_volume(device: Ada305, args: argparse.Namespace) -> int:
     plan = device.prepare_volume(
         args.channel,
@@ -375,18 +433,34 @@ def _describe_report(report: p.InterruptReport) -> str:
 
 
 def cmd_monitor(device: Ada305, args: argparse.Namespace) -> int:
+    length = (
+        args.length
+        if args.length is not None
+        else device.interrupt_packet_size
+    )
+    if length <= 0:
+        print("--length must be positive", file=sys.stderr)
+        return 2
+
     print(
-        "Listening on interrupt-IN endpoint 0x81. Read-only: reports are "
-        "decoded but never applied."
+        "Listening on interrupt-IN endpoint 0x81 with "
+        f"{length}-byte reads. Read-only: reports are decoded but never applied."
     )
     print("Press a speaker button or turn the knob; Ctrl-C stops.")
     count = 0
     try:
         while args.count == 0 or count < args.count:
             try:
-                report = device.read_interrupt(args.length, args.timeout)
+                report = device.read_interrupt(length, args.timeout)
             except TransportTimeout:
                 print("(timeout; still listening)")
+                continue
+            except TransportOverflow:
+                print(
+                    "(overflow; report dropped. Use --length "
+                    f"{device.interrupt_packet_size} or a multiple of it.)",
+                    file=sys.stderr,
+                )
                 continue
             print(
                 f"raw={report.raw.hex(' ') if report.raw else '(none)':<24} "
@@ -396,6 +470,10 @@ def cmd_monitor(device: Ada305, args: argparse.Namespace) -> int:
             count += 1
     except KeyboardInterrupt:
         print("\nStopped.")
+        print(
+            "If the speaker's own controls stay unresponsive, run: "
+            "ada305 release"
+        )
     return 0
 
 

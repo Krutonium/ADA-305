@@ -63,6 +63,15 @@ class Ada305:
     def __init__(self, transport: Transport) -> None:
         self.transport = transport
 
+    @property
+    def interrupt_packet_size(self) -> int:
+        size = getattr(self.transport, "interrupt_packet_size", 2)
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            return 2
+        return size if size > 0 else 2
+
     # -- register helpers ------------------------------------------------
 
     def read_register(self, register: int, length: int) -> bytes:
@@ -180,6 +189,30 @@ class Ada305:
 
     # -- writes ----------------------------------------------------------
 
+    def _begin_host_control(self) -> None:
+        """Bracket a host volume write (ALSERV writes 0x0500 <- 2)."""
+
+        self.transport.write_control(
+            p.REQ_REGISTER_WRITE,
+            p.REG_CONTROL,
+            p.encode_control(p.CONTROL_HOST),
+        )
+
+    def return_control(self) -> None:
+        """Give the speaker's local buttons and knob control again.
+
+        ALSERV writes register ``0x0500 = 3`` immediately after every
+        host-initiated volume change.  Without that release the speaker can
+        stay in host-control mode and ignore its own controls until it is
+        power cycled.
+        """
+
+        self.transport.write_control(
+            p.REQ_REGISTER_WRITE,
+            p.REG_CONTROL,
+            p.encode_control(p.CONTROL_LOCAL),
+        )
+
     def write_mute(self, muted: bool) -> bool:
         """Set mute, verify it, and return the read-back state."""
 
@@ -245,9 +278,15 @@ class Ada305:
                 "Read the status again."
             )
 
-        self.transport.write_control(
-            p.REQ_REGISTER_WRITE, plan.channel.register, plan.encoded
-        )
+        self._begin_host_control()
+        try:
+            self.transport.write_control(
+                p.REQ_REGISTER_WRITE, plan.channel.register, plan.encoded
+            )
+        finally:
+            # Always hand control back, even if the volume write failed, so a
+            # physical knob/button cannot be left locked out.
+            self.return_control()
         actual_db = self.read_channel(plan.channel.key).db
         if actual_db != plan.requested_db:
             raise DeviceError(
@@ -279,8 +318,12 @@ class Ada305:
     # -- interrupt monitor ----------------------------------------------
 
     def read_interrupt(
-        self, length: int = 7, timeout_ms: int = 5000
+        self,
+        length: Optional[int] = None,
+        timeout_ms: int = 5000,
     ) -> p.InterruptReport:
+        if length is None:
+            length = self.interrupt_packet_size
         raw = self.transport.read_interrupt(length, timeout_ms)
         return p.decode_interrupt_report(raw)
 

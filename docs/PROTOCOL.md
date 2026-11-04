@@ -70,7 +70,7 @@ fully characterised.
 | `0x0205` | 2 | Surround-left attenuation | R/W |
 | `0x0206` | 2 | Surround-right on some models; **not independent on ADA305** | n/a |
 | `0x0300` | 1 | Input / source routing | W (not used) |
-| `0x0500` | 1 | Auxiliary model-specific setup | W (not used) |
+| `0x0500` | 1 | Host/local control handoff: `2` = host applying, `3` = local | W |
 | `0xA500` | 1 | Mode state byte | R/W (read only here) |
 
 ### ADA305 channels
@@ -181,7 +181,35 @@ current value was used once to validate the OUT path and read back unchanged.
 
 ---
 
-## 5. State and mode
+## 5. Host/local control handoff (`0x0500`)
+
+ALSERV brackets every host-initiated volume write with a one-byte write to
+register `0x0500`:
+
+```c
+write_register(0x0500, 2);   // host is applying the change
+write_register(0x0200 + channel, encoded_volume);
+write_register(0x0500, 3);   // hand control back to the local controls
+```
+
+This is `FUN_00403ee0(2)` / `FUN_00403ee0(3)` in `ALSERV.exe`, called directly
+around `FUN_00404250` (the volume write). The same function is only called with
+`1` at startup on model `0x60`, where its meaning is not established. No other
+register I/O is bracketed this way, including the mute write (`0x0100`).
+
+The physical evidence is behavioural as well as static: leaving the device at
+`0x0500 = 2` (or omitting the release after a host write) is consistent with the
+speaker ignoring its own knob/buttons until it is power cycled. This library
+therefore sends `2`, performs the volume write, and always attempts `3`, even if
+the write fails. The explicit `ada305 release` command sends `3` on its own.
+`0x0500` is write-only here; there is no documented read-back to verify.
+
+This is distinct from `0xA500`, which is the *mode state byte* read by
+`FUN_00403cc0` and written by `FUN_00404000` as part of mode selection.
+
+---
+
+## 6. State and mode
 
 Mode is derived from two reads:
 
@@ -204,11 +232,20 @@ Mode is read by `ada305 status` and never written.
 
 ---
 
-## 6. Interrupt-IN reports
+## 7. Interrupt-IN reports
 
-Endpoint `0x81`, `wMaxPacketSize=2`. ALSERV nevertheless reads **7 bytes**
-because the same code serves 6-byte remote-control models. The ADA305 uses only
-the first two bytes (`ReportSize=2` in the old USB305 profile).
+Endpoint `0x81`, `wMaxPacketSize=2`. ALSERV nevertheless supplies a **7-byte
+buffer** to `ReadFileEx` because the same code serves 6-byte remote-control
+models. The Windows driver's interrupt URB uses the endpoint's max packet size,
+not that 7-byte user buffer. The ADA305 uses only the first two bytes
+(`ReportSize=2` in the old USB305 profile).
+
+On Linux, requesting 7 bytes directly from a 2-byte interrupt endpoint can make
+usbfs abort the URB with `EOVERFLOW` (errno 75): the fourth full packet would
+make 8 bytes and overrun the 7-byte buffer. The transport therefore allocates a
+whole number of max-size packets and trims the result, and `monitor` defaults to
+`2` bytes. If an overflow still occurs, the monitor drops that report and keeps
+listening instead of crashing.
 
 ```text
 byte 0  flags
@@ -254,7 +291,7 @@ covered by unit tests.
 
 ---
 
-## 7. Safety invariants implemented by this library
+## 8. Safety invariants implemented by this library
 
 1. Reads only unless a specific write command is given.
 2. Writes are validated against the documented attenuation range; unknown
@@ -266,13 +303,17 @@ covered by unit tests.
 5. Volume increases print a warning; they need no additional flag.
 6. `execute_volume` re-reads the current value immediately before the write and
    aborts if it changed after planning.
-7. Every write is read back and must match exactly.
-8. No startup/reset/initialise write is performed.
-9. The interrupt monitor never writes.
+7. Volume writes are bracketed with `0x0500 = 2` / `3`, and the release is
+   attempted in a `finally` block even if the volume write fails.
+8. Every write is read back and must match exactly, except the write-only
+   `0x0500` handoff.
+9. No startup/reset/initialise write is performed.
+10. The interrupt monitor never writes; `release` is a separate explicit
+    command.
 
 ---
 
-## 8. Provenance
+## 9. Provenance
 
 Static-analysis inputs, SHA-256:
 

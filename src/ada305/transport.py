@@ -31,8 +31,14 @@ class TransportTimeout(TransportError):
     """A read timed out (normal for the interrupt monitor when idle)."""
 
 
+class TransportOverflow(TransportError):
+    """The device sent more data than the transfer buffer could hold."""
+
+
 class Transport(Protocol):
     """Minimal interface the device layer needs; easy to fake in tests."""
+
+    interrupt_packet_size: int
 
     def read_control(self, request: int, value: int, length: int) -> bytes:
         ...
@@ -104,6 +110,7 @@ class PyUsbTransport:
         self.timeout_ms = int(timeout_ms)
         self._claimed = False
         self._product = _safe_string(device, "product")
+        self._interrupt_packet_size = self._discover_interrupt_packet_size()
 
     # -- construction ----------------------------------------------------
 
@@ -161,6 +168,27 @@ class PyUsbTransport:
             f"bus {self.bus:03d} address {self.address:03d})"
         )
 
+    @property
+    def interrupt_packet_size(self) -> int:
+        """The interrupt-IN endpoint's maximum packet size (2 on ADA305)."""
+
+        return self._interrupt_packet_size
+
+    def _discover_interrupt_packet_size(self) -> int:
+        try:
+            for config in self._device:
+                for interface in config:
+                    for endpoint in interface:
+                        if int(endpoint.bEndpointAddress) == self.INTERRUPT_ENDPOINT:
+                            size = int(endpoint.wMaxPacketSize) & 0x07FF
+                            if size > 0:
+                                return size
+        except (usb.core.USBError, AttributeError, TypeError, ValueError):
+            pass
+        # The ADA305 descriptor says 2; this fallback keeps reads safe if the
+        # descriptors cannot be walked for some reason.
+        return 2
+
     # -- transfers -------------------------------------------------------
 
     def _translate(self, exc: usb.core.USBError, operation: str) -> TransportError:
@@ -171,6 +199,12 @@ class PyUsbTransport:
                 f"{operation} was rejected before reaching the device "
                 f"({exc}). This usually means the wIndex/interface check "
                 "failed; the library uses wIndex=0 to avoid it."
+            )
+        if getattr(exc, "errno", None) == errno.EOVERFLOW:
+            return TransportOverflow(
+                f"{operation} overflowed ({exc}); the device sent more data "
+                "than the buffer. Use a read length that is a multiple of the "
+                "endpoint's max packet size."
             )
         return TransportError(f"{operation} failed: {exc}")
 
@@ -216,14 +250,27 @@ class PyUsbTransport:
         self._claimed = True
 
     def read_interrupt(self, length: int, timeout_ms: int) -> bytes:
+        length = int(length)
+        if length <= 0:
+            raise TransportError("interrupt read length must be positive")
+
         self._claim()
+        # On Linux, usbfs aborts an interrupt-IN URB with EOVERFLOW if the
+        # device returns a full final packet that would overrun the buffer.
+        # A request of 7 bytes on the 2-byte ADA305 endpoint is exactly that
+        # trap: the fourth packet would make 8 bytes.  Allocate a whole number
+        # of packets and trim afterwards so a button press cannot crash us.
+        packet = self.interrupt_packet_size
+        buffer_length = length
+        if packet > 0 and length % packet:
+            buffer_length = ((length // packet) + 1) * packet
         try:
             data = self._device.read(
-                self.INTERRUPT_ENDPOINT, length, timeout=timeout_ms
+                self.INTERRUPT_ENDPOINT, buffer_length, timeout=timeout_ms
             )
         except usb.core.USBError as exc:
             raise self._translate(exc, "interrupt read") from exc
-        return bytes(data)
+        return bytes(data)[:length]
 
     def close(self) -> None:
         if self._claimed:
@@ -245,6 +292,7 @@ __all__ = [
     "PyUsbTransport",
     "Transport",
     "TransportError",
+    "TransportOverflow",
     "TransportTimeout",
     "enumerate_devices",
 ]

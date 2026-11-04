@@ -9,6 +9,14 @@ from ada305.device import Ada305, DeviceError
 from ada305.safety import MirroredChannelError, VeryLoudNotAllowed
 
 
+def bracketed(register, data):
+    return [
+        (p.REQ_REGISTER_WRITE, p.REG_CONTROL, b"\x02"),
+        (p.REQ_REGISTER_WRITE, register, data),
+        (p.REQ_REGISTER_WRITE, p.REG_CONTROL, b"\x03"),
+    ]
+
+
 def test_read_status_is_read_only(device, transport):
     status = device.read_status()
     assert transport.writes == []
@@ -70,9 +78,7 @@ def test_quieter_volume_write_encoding(device, transport):
     assert result.level == 50
     assert result.db == 60
     assert result.changed is True
-    assert transport.writes == [
-        (p.REQ_REGISTER_WRITE, p.REG_VOLUME_BASE, b"\x00\x3c")
-    ]
+    assert transport.writes == bracketed(p.REG_VOLUME_BASE, b"\x00\x3c")
 
 
 def test_louder_volume_is_allowed_by_default(device, transport):
@@ -82,7 +88,12 @@ def test_louder_volume_is_allowed_by_default(device, transport):
     result = device.execute_volume(plan)
     assert result.level == 60
     assert result.db == 53
-    assert transport.writes[-1][2] == b"\x00\x35"
+    assert transport.writes[-2][2] == b"\x00\x35"
+    assert transport.writes[-1] == (
+        p.REQ_REGISTER_WRITE,
+        p.REG_CONTROL,
+        b"\x03",
+    )
 
 
 def test_level_90_is_allowed_without_opt_in(device, transport):
@@ -102,9 +113,7 @@ def test_level_91_with_opt_in_writes(device, transport):
     result = device.execute_volume(plan)
     assert result.level == 91
     assert result.db == 31
-    assert transport.writes == [
-        (p.REQ_REGISTER_WRITE, p.REG_VOLUME_BASE, b"\x00\x1f")
-    ]
+    assert transport.writes == bracketed(p.REG_VOLUME_BASE, b"\x00\x1f")
 
 
 def test_level_100_with_opt_in_writes_maximum(device, transport):
@@ -112,9 +121,7 @@ def test_level_100_with_opt_in_writes_maximum(device, transport):
     result = device.execute_volume(plan)
     assert result.level == 100
     assert result.db == 25
-    assert transport.writes == [
-        (p.REQ_REGISTER_WRITE, p.REG_VOLUME_BASE, b"\x00\x19")
-    ]
+    assert transport.writes == bracketed(p.REG_VOLUME_BASE, b"\x00\x19")
 
 
 def test_mirrored_channel_refused(device, transport):
@@ -145,3 +152,35 @@ def test_read_back_mismatch_is_an_error(device, transport):
     transport.write_control = lying_write
     with pytest.raises(DeviceError):
         device.execute_volume(plan)
+
+
+def test_return_control_writes_local_value(device, transport):
+    device.return_control()
+    assert transport.writes == [
+        (p.REQ_REGISTER_WRITE, p.REG_CONTROL, b"\x03")
+    ]
+
+
+def test_volume_failure_still_returns_control(device, transport):
+    plan = device.prepare_volume("master", 50)
+
+    def failing_write(request, value, data):
+        if value == p.REG_VOLUME_BASE:
+            raise AssertionError("simulated volume write failure")
+        transport.writes.append((request, value, bytes(data)))
+        return len(data)
+
+    transport.write_control = failing_write
+    with pytest.raises(AssertionError):
+        device.execute_volume(plan)
+    assert transport.writes == [
+        (p.REQ_REGISTER_WRITE, p.REG_CONTROL, b"\x02"),
+        (p.REQ_REGISTER_WRITE, p.REG_CONTROL, b"\x03"),
+    ]
+
+
+def test_read_interrupt_defaults_to_packet_size(device, transport):
+    transport.interrupt_reports = [b"\x00\x3c"]
+    report = device.read_interrupt(timeout_ms=123)
+    assert report.volume_delta == 60
+    assert transport.reads == [("interrupt", 2, 123)]

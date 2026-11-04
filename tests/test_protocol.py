@@ -38,6 +38,16 @@ def test_decode_volume_rejects_size_and_high_byte():
         p.decode_volume(b"\x01\x38")
 
 
+def test_control_codec():
+    assert p.encode_control(p.CONTROL_HOST) == b"\x02"
+    assert p.encode_control(p.CONTROL_LOCAL) == b"\x03"
+    for bad in (0, 1, 4, -1):
+        with pytest.raises(p.ProtocolError):
+            p.encode_control(bad)
+    with pytest.raises(TypeError):
+        p.encode_control(True)
+
+
 def test_mute_codec():
     assert p.encode_mute(True) == b"\x01"
     assert p.encode_mute(False) == b"\x00"

@@ -80,8 +80,13 @@ WINDEX_WINDOWS_DRIVER: Final = 0x0F01
 REG_MUTE: Final = 0x0100
 REG_VOLUME_BASE: Final = 0x0200
 REG_INPUT_CONTROL: Final = 0x0300  # 1-byte write-only, source/input routing
-REG_AUX_CONTROL: Final = 0x0500    # 1-byte write-only, model-specific setup
+REG_CONTROL: Final = 0x0500        # 1-byte write-only, host/local control handoff
 REG_MODE_STATE: Final = 0xA500     # 1-byte read/write mode state
+
+# ALSERV writes these values to 0x0500 immediately before and after a
+# host-initiated volume change (FUN_00403ee0(2) / FUN_00403ee0(3)).
+CONTROL_HOST: Final = 2   # host is applying a change; keep local input quiet
+CONTROL_LOCAL: Final = 3  # hand control back to the speaker's buttons/knob
 
 # Hardware limits taken from ALADA.INF / acs495.inf for ADA305 / ADA495.
 # Register value is attenuation in dB; larger is quieter.
@@ -218,6 +223,18 @@ def decode_volume(raw: bytes) -> int:
     return raw[1]
 
 
+def encode_control(value: int) -> bytes:
+    """Encode the one-byte 0x0500 host/local control handoff value."""
+
+    value = _require_int(value, "control mode")
+    if value not in (CONTROL_HOST, CONTROL_LOCAL):
+        raise ProtocolError(
+            f"control mode must be {CONTROL_HOST} (host) or "
+            f"{CONTROL_LOCAL} (local), not {value}"
+        )
+    return bytes((value,))
+
+
 def encode_mute(muted: bool) -> bytes:
     """Encode the mute register: 0 = unmuted, 1 = muted."""
 
@@ -316,8 +333,8 @@ def decode_interrupt_report(raw: bytes) -> InterruptReport:
     """Decode a report from interrupt-IN endpoint 0x81.
 
     The ADA305 endpoint has a 2-byte max packet and the old USB305 profile
-    specifies ``ReportSize=2``; ALSERV nevertheless reads 7 bytes because the
-    same code serves 6-byte remote-control models.  Only bytes 0 and 1 are
+    specifies ``ReportSize=2``; ALSERV supplies a 7-byte Windows buffer because
+    the same code serves 6-byte remote-control models.  Only bytes 0 and 1 are
     meaningful for the ADA305.  A 2-byte or longer report is accepted.
     """
 

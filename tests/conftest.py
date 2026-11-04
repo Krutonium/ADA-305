@@ -16,6 +16,7 @@ class FakeTransport:
     """In-memory stand-in for :class:`ada305.transport.PyUsbTransport`."""
 
     description = "fake ADA305 (04d2:0305)"
+    interrupt_packet_size = 2
 
     def __init__(self, registers=None, state_byte: int = 1) -> None:
         self.registers = {
@@ -34,6 +35,7 @@ class FakeTransport:
         self.state_byte = state_byte
         self.reads = []
         self.writes = []
+        self.interrupt_reports = []
         self.closed = False
 
     # -- Transport protocol ------------------------------------------------
@@ -58,7 +60,12 @@ class FakeTransport:
 
     def read_interrupt(self, length: int, timeout_ms: int) -> bytes:
         self.reads.append(("interrupt", length, timeout_ms))
-        raise AssertionError("no interrupt report configured")
+        if not self.interrupt_reports:
+            raise AssertionError("no interrupt report configured")
+        item = self.interrupt_reports.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return bytes(item)
 
     def close(self) -> None:
         self.closed = True
