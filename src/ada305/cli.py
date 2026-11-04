@@ -275,6 +275,14 @@ examples:
         "(default 0.35)",
     )
     follow.add_argument(
+        "--wheel-debounce",
+        type=float,
+        default=0.4,
+        metavar="SECONDS",
+        help="coalesce repeated wheel packets from one detent within this "
+        "window (default 0.4)",
+    )
+    follow.add_argument(
         "--count",
         type=int,
         default=0,
@@ -512,11 +520,15 @@ def cmd_follow(device: Ada305, args: argparse.Namespace) -> int:
     if args.debounce < 0:
         print("--debounce must not be negative", file=sys.stderr)
         return 2
+    if args.wheel_debounce < 0:
+        print("--wheel-debounce must not be negative", file=sys.stderr)
+        return 2
 
     settings = FollowerSettings(
         allow_increase=args.allow_increase,
         allow_very_loud=args.yes_very_loud,
         debounce_seconds=args.debounce,
+        wheel_debounce_seconds=args.wheel_debounce,
         channel_timeout_seconds=args.channel_timeout,
         dry_run=args.dry_run,
     )

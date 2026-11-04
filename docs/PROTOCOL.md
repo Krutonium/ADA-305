@@ -280,7 +280,11 @@ new_attenuation = current_attenuation - delta
 ```
 
 so a **positive delta means louder** (attenuation decreases). Live wheel
-captures: `00 01` is one click louder and `00 ff` is one click quieter. The
+captures: `00 01` is one click louder and `00 ff` is one click quieter. One
+physical detent emits one to three identical reports in a short burst, so a
+host-side follower must coalesce them or one click will make several volume
+steps. A read-only capture of five deliberate clockwise clicks, one second
+apart, produced bursts of 3, 1, 3, 1, and 3 identical `00 01` reports. The
 report is a *request*: the host is expected to apply it with a control write.
 The device does not change its own volume register from a button press. This is
 why the wheel can click with no audible change while only a read-only monitor
@@ -333,9 +337,11 @@ follow` refuses changes outside the documented range and gates loud targets.
   by default).
 * Three seconds after the last volume change on a selected channel, the
   follower returns to master, matching the AMS help text and ALSERV's timer.
-* Each wheel report is one attenuation step: `new = current - delta`. The
-  follower reads the current value, ignores a step outside the channel range,
-  writes the new value directly, and verifies it.
+* Each wheel report is one attenuation step: `new = current - delta`. One
+  physical detent repeats the same report two or three times, so wheel packets
+  within 0.4 s are coalesced into one step (`--wheel-debounce`). The follower
+  reads the current value, ignores a step outside the channel range, writes the
+  new value directly, and verifies it.
 * A debounced `01` toggles mute.
 * `80` drops the selection, re-reads mute/mode, and returns to master.
 

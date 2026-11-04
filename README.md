@@ -197,7 +197,9 @@ press the same selector again (or wait three seconds after the last volume
 change) to return the wheel to master. The mute combination toggles mute.
 
 The follower is a foreground process; stop it with Ctrl-C. It applies each
-wheel click directly and verifies the read-back. A click that would leave the
+wheel click directly and verifies the read-back. One physical detent emits
+several identical reports, so packets from one detent are coalesced into a
+single step (0.4 s window, `--wheel-debounce`). A click that would leave the
 documented attenuation range is ignored, never clamped.
 
 ### `release` and register `0x0500`

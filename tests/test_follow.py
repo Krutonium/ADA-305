@@ -145,6 +145,40 @@ def test_dry_run_never_writes(device, transport, clock, logs, warnings):
     assert any("[dry-run]" in message for message in logs)
 
 
+def test_repeated_wheel_packets_from_one_detent_are_coalesced(
+    device, transport, clock, logs, warnings
+):
+    follower = make_follower(device, clock, logs, warnings)
+    for _ in range(3):
+        follower.handle_report(report(delta=-1))
+        clock.advance(0.1)
+    assert transport.writes == [
+        (p.REQ_REGISTER_WRITE, p.REG_VOLUME_BASE, b"\x00\x39")
+    ]
+
+    # A genuine click after the window still applies.
+    clock.advance(0.2)
+    follower.handle_report(report(delta=-1))
+    assert transport.writes == [
+        (p.REQ_REGISTER_WRITE, p.REG_VOLUME_BASE, b"\x00\x39"),
+        (p.REQ_REGISTER_WRITE, p.REG_VOLUME_BASE, b"\x00\x3a"),
+    ]
+
+
+def test_opposite_packet_in_a_wheel_burst_is_ignored(
+    device, transport, clock, logs, warnings
+):
+    follower = make_follower(
+        device, clock, logs, warnings, allow_increase=True
+    )
+    follower.handle_report(report(delta=-1))
+    clock.advance(0.1)
+    follower.handle_report(report(delta=1))
+    assert transport.writes == [
+        (p.REQ_REGISTER_WRITE, p.REG_VOLUME_BASE, b"\x00\x39")
+    ]
+
+
 # -- channel selectors ----------------------------------------------------
 
 

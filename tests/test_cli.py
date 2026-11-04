@@ -380,3 +380,8 @@ def test_follow_rejects_bad_options(monkeypatch, transport, capsys):
     assert run(monkeypatch, transport, ["follow", "--count", "-1"]) == 2
     assert transport.writes == []
     assert "--count" in capsys.readouterr().err
+    assert (
+        run(monkeypatch, transport, ["follow", "--wheel-debounce", "-1"]) == 2
+    )
+    assert transport.writes == []
+    assert "--wheel-debounce" in capsys.readouterr().err

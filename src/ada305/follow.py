@@ -8,7 +8,9 @@ apply them with control writes.  :class:`Follower` implements that loop:
   same selector again returns to master, and the selection expires after three
   seconds without a volume change (matching the AMS help text and ALSERV).
 * ``00 01`` / ``00 ff`` are one wheel click louder / quieter.  The delta is
-  applied to the active channel (master when none is selected).
+  applied to the active channel (master when none is selected).  One physical
+  detent emits several identical reports, so wheel reports inside
+  ``wheel_debounce_seconds`` are coalesced into one step.
 * ``01`` toggles mute.  Repeated packets for one press are debounced.
 * ``80`` means reconnect: drop the active selection and re-read the device.
 
@@ -37,6 +39,7 @@ class FollowerSettings:
     allow_increase: bool = False
     allow_very_loud: bool = False
     debounce_seconds: float = 0.35
+    wheel_debounce_seconds: float = 0.4
     channel_timeout_seconds: float = 3.0
     warning_interval_seconds: float = 2.0
     dry_run: bool = False
@@ -44,6 +47,7 @@ class FollowerSettings:
     def __post_init__(self) -> None:
         for name in (
             "debounce_seconds",
+            "wheel_debounce_seconds",
             "channel_timeout_seconds",
             "warning_interval_seconds",
         ):
@@ -76,6 +80,7 @@ class Follower:
         self._deadline: Optional[float] = None
         self._last_selector: Dict[int, float] = {}
         self._last_mute: Optional[float] = None
+        self._last_wheel: Optional[float] = None
         self._last_warning: Dict[str, float] = {}
 
     # -- public API ------------------------------------------------------
@@ -199,6 +204,15 @@ class Follower:
         self._log(f"mute {'on' if actual else 'off'}")
 
     def _handle_wheel(self, delta: int, now: float) -> None:
+        # One detent reports the same delta two or three times in a burst.
+        # Coalesce the burst so one physical click makes one volume step.
+        if (
+            self._last_wheel is not None
+            and now - self._last_wheel < self.settings.wheel_debounce_seconds
+        ):
+            return
+        self._last_wheel = now
+
         channel = self.active
         try:
             current_db = self.device.read_channel(channel.key).db
